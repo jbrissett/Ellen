@@ -940,7 +940,11 @@ def _run(
         if order_id:
             step = "capture-estimate"
             try:
-                estimate = _capture_estimate(page, order_id, run_dir, log)
+                # Pass the request so the capture step can auto-apply any
+                # subtype outliers (per-location subtypes that differ from
+                # the group default) BEFORE generating the PDF. See
+                # _apply_outliers_to_estimate_modal for rationale.
+                estimate = _capture_estimate(page, order_id, run_dir, log, request=request)
             except Exception as exc:
                 log(f"(Estimate capture failed: {exc} — proceeding without it)")
             step_idx += 1; _save_step_snapshot(page, run_dir, step_idx, step)
@@ -948,12 +952,20 @@ def _run(
         if order_id:
             note_parts = [f"Order {order_id} submitted."]
             if estimate and estimate.lines:
-                total_str = (
-                    f"~${estimate.total:,.2f}" if estimate.total is not None else "total unknown"
-                )
-                note_parts.append(
-                    f"Estimate captured ({len(estimate.lines)} line(s), {total_str})."
-                )
+                # No dollar total in the chat-visible note — user opens the
+                # PDF for that. Per feedback 2026-05-25, Ellen has been wrong
+                # about totals enough times that the chat surface is no
+                # longer trusted to show them. See chat.py SYSTEM_PROMPT
+                # "NEVER quote a dollar total in chat" + scrub helpers.
+                note_parts.append(f"Estimate captured ({len(estimate.lines)} line(s)).")
+                # Surface the auto-applied subtype corrections so the user
+                # can confirm at a glance that pre-stated instructions made
+                # it through to the PDF — without us quoting any dollars.
+                if estimate.parse_note and "Auto-applied subtype outliers" in estimate.parse_note:
+                    for line in estimate.parse_note.splitlines():
+                        if line.startswith("Auto-applied subtype outliers"):
+                            note_parts.append(line + ".")
+                            break
             elif estimate:
                 note_parts.append("Estimate captured (no lines parsed — see HTML).")
             note_parts.append("Browser left open for verification.")
@@ -3449,8 +3461,93 @@ def _submit_request(page: Page, log: ProgressCallback) -> tuple[Optional[str], O
     return order_id, page.url
 
 
+def _apply_outliers_to_estimate_modal(
+    page: Page,
+    request: StudyRequest,
+    lines: list[EstimateLine],
+    log: ProgressCallback,
+) -> tuple[int, list[str]]:
+    """Walk the StudyRequest's TMC groups for subtype outliers (locations
+    whose per-row subtype differs from the group's default) and apply
+    each one directly to the live Estimate modal — before the PDF is
+    generated, so the very first PDF the user opens already reflects
+    the requested subtypes.
+
+    Returns (corrections_count, summary_lines) where summary_lines is a
+    short human-readable list of what was changed, suitable for inclusion
+    in the chat note Ellen sees.
+
+    Established 2026-05-25 after user reported: "she received instructions
+    at the onset to make the roundabout complex, but that didnt translate
+    to the estimate until prompted again, and then prodded to do so."
+    The extractor was already flagging the outlier correctly; the planner
+    was already logging it during _add_study_groups. The gap was the
+    last mile — Ellen waited for the user to ask instead of treating the
+    documented outlier as a deterministic instruction to apply post-submit.
+
+    Matching strategy: for each outlier `site_name`, find ALL estimate
+    line indices whose `description` starts with that site name
+    (case-insensitive). Multiple matches are expected (one per time
+    window — AM Peak + PM Peak each get their own row), and ALL get the
+    correction. Misses are logged but don't fail the order.
+    """
+    groups = _group_locations_for_qchub(request)
+    all_outliers: list[dict] = []
+    for g in groups:
+        for o in (g.get("subtype_outliers") or []):
+            all_outliers.append(o)
+    if not all_outliers:
+        return 0, []
+
+    log(f"  Auto-applying {len(all_outliers)} subtype outlier(s) flagged at planning time…")
+    corrections = 0
+    summary: list[str] = []
+    for outlier in all_outliers:
+        site_name = (outlier.get("site_name") or "").strip()
+        target_subtype = (outlier.get("actual_subtype") or "").strip()
+        if not site_name or not target_subtype:
+            continue
+        # Match by case-insensitive prefix on the description. The
+        # description format is "<site_name> — <when> — <subtype>", so
+        # startswith(site_name.lower()) is the right discriminator.
+        site_lower = site_name.lower()
+        match_indices = [
+            i for i, L in enumerate(lines)
+            if (L.description or "").lower().startswith(site_lower)
+        ]
+        if not match_indices:
+            log(
+                f"    ⚠ Couldn't find {site_name!r} in estimate lines to apply "
+                f"{target_subtype!r} — leaving as group default."
+            )
+            continue
+        for idx in match_indices:
+            try:
+                result = _js_set_subtype_on_row(page, idx, target_subtype)
+            except Exception as exc:
+                log(f"    ⚠ Auto-apply failed on row {idx} ({site_name}): {exc}")
+                continue
+            if not result.get("ok"):
+                log(
+                    f"    ⚠ Couldn't set {target_subtype!r} on row {idx} ({site_name}): "
+                    f"{result.get('error')}"
+                )
+                continue
+            corrections += 1
+            page.wait_for_timeout(150)  # brief settle between writes
+        summary.append(f"{site_name} → {target_subtype} ({len(match_indices)} row(s))")
+    if corrections:
+        # Let Angular fully cascade the last batch of changes before the
+        # PDF preview is triggered. Mirrors the 400ms settle the live edit
+        # command path uses after every set_subtype.
+        page.wait_for_timeout(500)
+        log(f"  Auto-applied {corrections} subtype correction(s).")
+    return corrections, summary
+
+
 def _capture_estimate(
     page: Page, order_id: str, run_dir: Path, log: ProgressCallback,
+    *, request: Optional[StudyRequest] = None,
 ) -> Optional[Estimate]:
     """After SUBMIT REQUEST redirected us to /Admin/Orders/{id}, open the
     Estimate modal and capture the priced lines so the user can review
@@ -3527,6 +3624,31 @@ def _capture_estimate(
     except Exception as exc:
         parse_note = f"Parser raised {type(exc).__name__}: {exc}"
         log(f"(Estimate parser failed: {exc} — HTML/screenshot still saved.)")
+
+    # 4b. Auto-apply any subtype outliers flagged at planning time.
+    # If the extractor caught a per-location subtype that differs from
+    # the group default (e.g., the roundabout came through as Complex in
+    # a group of mostly Standard TMCs), apply it to the live modal NOW
+    # so the PDF generated in step 5 already has the correction.
+    # Without this step, Ellen had to wait for the user to re-ask post-PDF
+    # before the deterministic instruction was honored (observed
+    # run-20260525-103250, user feedback 2026-05-25).
+    auto_applied_summary: list[str] = []
+    if request and lines:
+        try:
+            n_corrections, auto_applied_summary = _apply_outliers_to_estimate_modal(
+                page, request, lines, log
+            )
+            if n_corrections > 0:
+                # Re-parse so the Estimate object we return reflects the
+                # post-correction state. The PDF capture in step 5 will
+                # also see the new subtypes.
+                try:
+                    lines = _parse_estimate_rows_from_modal(modal)
+                except Exception as exc:
+                    log(f"(Re-parse after auto-apply failed: {exc} — using pre-apply lines)")
+        except Exception as exc:
+            log(f"(Subtype outlier auto-apply failed: {exc} — proceeding without it)")
 
     grand_total = (
         sum(L.line_total for L in lines if L.line_total is not None)
@@ -3685,6 +3807,13 @@ def _capture_estimate(
             page.context.remove_listener("response", _on_response)
         except Exception:
             pass
+
+    # Fold the auto-applied subtype summary into parse_note so the user
+    # (and Ellen) can see what corrections were made. Keep any existing
+    # parse_note content; append, don't overwrite.
+    if auto_applied_summary:
+        note_extra = "Auto-applied subtype outliers: " + "; ".join(auto_applied_summary)
+        parse_note = f"{parse_note}\n{note_extra}" if parse_note else note_extra
 
     estimate = Estimate(
         order_id=order_id,

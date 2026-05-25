@@ -624,11 +624,22 @@ class MainWindow(QMainWindow):
             self._artifacts["estimate_html_path"] = result.estimate.html_path
             self._artifacts["estimate_screenshot_path"] = result.estimate.screenshot_path
             self._artifacts["estimate_pdf_path"] = result.estimate.pdf_path
-            self._artifacts["estimate_total"] = result.estimate.total
+            # estimate_total intentionally NOT exposed to Ellen — per user
+            # direction 2026-05-25 the chat surface must never carry the
+            # grand total (the user reads it from the PDF). Same reason
+            # _scrub_dollars_from_estimate_result strips per-line dollars
+            # before tool results return.
             self._artifacts["estimate_line_count"] = len(result.estimate.lines)
             # Keep the full structured estimate too (Ship 2's get_estimate
-            # tool will read this).
-            self._artifacts["estimate"] = result.estimate.model_dump(exclude_none=True)
+            # tool will read this), but scrub dollar fields so Ellen can't
+            # quote them. The scrubber rewrites `total`, `line_total`,
+            # `unit_price`, `quantity`, and `extra_rate` to "<see PDF>"
+            # both at the top level (the Estimate's grand `total`) and
+            # nested inside each line dict.
+            from ..chat import _scrub_dollars_from_estimate_result
+            self._artifacts["estimate"] = _scrub_dollars_from_estimate_result(
+                result.estimate.model_dump(exclude_none=True)
+            )
 
         # Report into the chat instead of a modal.
         parts = []
@@ -648,9 +659,12 @@ class MainWindow(QMainWindow):
         # (`get_estimate_lines`) when the user asks about specific rows.
         if result.estimate is not None and result.estimate.lines:
             est = result.estimate
+            # No dollar total in the chat system note — user opens the PDF
+            # for the number. Per feedback 2026-05-25: Ellen has been wrong
+            # about totals on multiple prior runs, and the user always
+            # opens the PDF anyway, so the chat surface adds risk with
+            # zero upside. Keep the line-count for context.
             summary = f"&nbsp;&nbsp;<b>Estimate:</b> {len(est.lines)} line(s)"
-            if est.total is not None:
-                summary += f", total <b>${est.total:,.2f}</b>"
             parts.append(summary)
             if est.parse_note:
                 parts.append(f"&nbsp;&nbsp;<i>Note: {est.parse_note}</i>")
