@@ -5708,7 +5708,7 @@ def auto_create_for_missing_entity(
     else:
         log(f"  Phone (from signature): {phone}")
 
-    # --- COMPANY: check via User-form CompanyID dropdown (Branch A: single-tab) ---
+    # --- COMPANY: check via User-form CompanyID dropdown (Branch B: multi-tab) ---
     # Per user direction 2026-05-25, use the User-form CompanyID
     # dropdown as the source of truth for company existence — the
     # /Admin/Companies search box is unreliable. The CompanyID
@@ -5719,7 +5719,13 @@ def auto_create_for_missing_entity(
     # Charlotte" matching a "Kimley-Horn" request) get bound to the
     # existing entry; the user sees a notification in the run log.
     # Anything weaker triggers the pivot to create a new company.
-    log(f"--- Company step (Branch A: single-tab): {name!r} ---")
+    #
+    # BRANCH B difference: when a new company IS needed, drive the
+    # create on a fresh browser tab (via `page.context.new_page()`)
+    # instead of the original page. Theory: isolating company-create
+    # from the user-create flow's page state reduces the chance of
+    # Angular / kendo state corruption on the original tab.
+    log(f"--- Company step (Branch B: multi-tab): {name!r} ---")
     existing = peek_user_form_company_options(page, log)
     near = find_company_near_matches(name, existing, max_matches=5)
     best = near[0] if near else None
@@ -5773,14 +5779,34 @@ def auto_create_for_missing_entity(
             address_1=address_1, address_2="",
             city=city, state=state, zip_code=zip_code,
         )
-        # BRANCH A: drive company-create on the SAME page (Playwright tab)
-        # that the orchestrator was handed. `create_company_via_admin`
-        # navigates to /Admin/Companies and does the work there.
-        # Cancel any leftover Add Client User kendo dialog from the peek
-        # (defensive — peek_user_form_company_options should have done so
-        # but belt-and-suspenders).
-        _close_kendo_dialogs_gracefully(page, log)
-        company_match = create_company_via_admin(page, company_info, log, run_dir=run_dir)
+        # BRANCH B: open a NEW BROWSER TAB and drive `create_company_via_admin`
+        # there. This isolates the company-create flow from the original
+        # tab's page state — useful if a leftover kendo overlay or
+        # half-loaded modal on the original page would otherwise
+        # interfere with the company create. Trade-off: more Playwright
+        # objects to coordinate, no obvious win when the original
+        # tab is already clean.
+        #
+        # Same context (not a new browser window) — shares cookies +
+        # auth + the same qchub session so we don't have to log in
+        # twice. `page.context.new_page()` is the standard way.
+        log("  Opening a new browser tab for the company create…")
+        company_tab = None
+        try:
+            company_tab = page.context.new_page()
+            company_match = create_company_via_admin(
+                company_tab, company_info, log, run_dir=run_dir,
+            )
+        finally:
+            # Always close the new tab, even on failure, so we don't
+            # leak browser pages. The qchub session in the original
+            # tab is unaffected by this close.
+            if company_tab is not None:
+                try:
+                    company_tab.close()
+                    log("  Closed the new browser tab after company create.")
+                except Exception as exc:
+                    log(f"  (couldn't close company-create tab: {exc})")
         if not company_match:
             log(f"⚠ Auto-create FAILED for company {name!r} — falling back to manual modal.")
             return False
