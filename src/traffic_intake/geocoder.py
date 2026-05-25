@@ -81,6 +81,22 @@ REQUEST_TIMEOUT_SEC = 10
 # worst-case time bounded under the geocoder phase budget.
 OVERPASS_TIMEOUT_SEC = 10
 
+# Tuple form is required because requests' single-value timeout applies to
+# BOTH connect and the "between bytes" read window — not to total wall time.
+# Observed Zephyrhills trace 2026-05-25: a Places autocomplete call with
+# `timeout=10` hung 80+ seconds when the server slow-trickled bytes. Tuple
+# form caps both phases independently and prevents that runaway.
+_REQ_TIMEOUT = (REQUEST_TIMEOUT_SEC, REQUEST_TIMEOUT_SEC)
+_OVERPASS_TIMEOUT = (OVERPASS_TIMEOUT_SEC, OVERPASS_TIMEOUT_SEC)
+
+# Module-level connection pool. Without this, every call paid a fresh TLS
+# handshake (~3-5 round trips) — the 40s cold bbox_lookup was largely
+# handshake overhead, not Google compute. Session reuses keep-alive
+# connections across calls (and across worker threads — requests.Session
+# is thread-safe for its core HTTP methods).
+_SESSION = requests.Session()
+_SESSION.headers.update({"User-Agent": "Ellen (Quality Counts) traffic-study intake"})
+
 
 @dataclass
 class GeocodeResult:
@@ -129,8 +145,16 @@ class GeocodeResult:
 
 # Module-level cache for (city, state) → bbox lookups. One Geocoding call
 # per unique city per process lifetime. Thread-safe via the lock.
+#
+# Per-key in-flight locks deduplicate concurrent FIRST-misses: without
+# them, two parallel workers can both check the cache (empty), both make
+# the same ~40s Google call, both wait, both write the same result.
+# Observed trace 2026-05-25: Zephyrhills FL had 2× 40.7s bbox_lookup
+# events fired simultaneously by two workers. Now the second worker
+# blocks on the first worker's lock until the bbox is cached.
 _bbox_cache: dict[tuple[str, str], Optional[dict]] = {}
-_bbox_cache_lock = threading.Lock()
+_bbox_cache_lock = threading.Lock()  # guards cache reads/writes
+_bbox_inflight_locks: dict[tuple[str, str], threading.Lock] = {}  # per-key fetch locks
 
 
 class GeocoderUnavailable(Exception):
@@ -275,22 +299,74 @@ def _locality_bbox(city: str, state: str, api_key: str) -> Optional[dict]:
     """Return the city's bounding box for use as Places `locationRestriction`.
 
     Issues exactly ONE Geocoding API call per unique (city, state) per
-    process lifetime; subsequent lookups hit the in-memory cache. Returns
-    a dict like {"low": {"latitude": .., "longitude": ..},
-    "high": {"latitude": .., "longitude": ..}} or None if the city
+    process lifetime; subsequent lookups (including concurrent ones from
+    parallel geocoder workers) block on a per-key in-flight lock until
+    the first thread populates the cache. Returns a dict like
+    {"low": {"latitude": .., "longitude": ..},
+     "high": {"latitude": .., "longitude": ..}} or None if the city
     couldn't be resolved.
     """
     key = (city.strip().lower(), state.strip().upper())
+    # Fast path: already cached
     with _bbox_cache_lock:
         if key in _bbox_cache:
             return _bbox_cache[key]
+        # Get or create the per-key in-flight lock atomically under the
+        # main cache lock to avoid two threads creating different locks.
+        fetch_lock = _bbox_inflight_locks.setdefault(key, threading.Lock())
+
+    # Per-key lock dedupes concurrent first-misses. The second arriving
+    # thread blocks here until the first one finishes its fetch + write.
+    with fetch_lock:
+        with _bbox_cache_lock:
+            if key in _bbox_cache:
+                # First thread already populated while we were waiting.
+                return _bbox_cache[key]
+        # We're the first (or sole) thread to fetch. Do the API call,
+        # write the result, return.
+        return _locality_bbox_fetch(key, city, state, api_key)
+
+
+def prewarm_bboxes(addresses: list[str], api_key: str) -> int:
+    """Resolve city bboxes for all unique (city, state) pairs in `addresses`
+    BEFORE the threadpool launches. Returns the number of unique cities
+    resolved (for logging).
+
+    Why: workers in the geocoder threadpool each call `_locality_bbox` as
+    their first step. If that's a cold miss, the worker blocks ~40s on a
+    Google Geocoding call. The dedupe lock saves the duplicate API call
+    but NOT the wall-clock wait — every parallel worker waits for the
+    first one. Resolving sequentially up-front (1 cold call per unique
+    city) means every worker sees a cache hit and starts geocoding
+    immediately. Net win on a 4-address, 1-city email: ~40s → ~0s
+    blocked time per worker.
+    """
+    seen: set[tuple[str, str]] = set()
+    for addr in addresses:
+        parsed = _parse_intersection(addr)
+        if parsed is None:
+            continue
+        key = (parsed["city"].strip().lower(), parsed["state"].strip().upper())
+        if key in seen:
+            continue
+        seen.add(key)
+        # Fires the cold call + caches the result. Subsequent worker
+        # calls to `_locality_bbox(city, state, ...)` will hit the cache.
+        _locality_bbox(parsed["city"], parsed["state"], api_key)
+    return len(seen)
+
+
+def _locality_bbox_fetch(
+    key: tuple[str, str], city: str, state: str, api_key: str,
+) -> Optional[dict]:
+    """Inner fetch — caller holds the per-key in-flight lock."""
     params = {
         "address": f"{city}, {state}",
         "components": f"country:US|administrative_area:{state}",
         "key": api_key,
     }
     try:
-        r = requests.get(GEOCODE_URL, params=params, timeout=REQUEST_TIMEOUT_SEC)
+        r = _SESSION.get(GEOCODE_URL, params=params, timeout=_REQ_TIMEOUT)
         r.raise_for_status()
     except requests.RequestException as exc:
         log.info("Locality bbox lookup failed for %r, %r: %s", city, state, exc)
@@ -453,12 +529,7 @@ def _overpass_intersection(
         "out 5;\n"
     )
     try:
-        r = requests.post(
-            OVERPASS_URL,
-            data={"data": ql},
-            timeout=OVERPASS_TIMEOUT_SEC,
-            headers={"User-Agent": "Ellen (Quality Counts) traffic-study intake"},
-        )
+        r = _SESSION.post(OVERPASS_URL, data={"data": ql}, timeout=_OVERPASS_TIMEOUT)
         r.raise_for_status()
     except requests.RequestException as exc:
         log.info("Overpass call failed for %r × %r: %s — falling through to Places.",
@@ -542,11 +613,11 @@ def _places_new_search_text(
         "X-Goog-FieldMask": "places.location,places.formattedAddress,places.types,places.id",
     }
     try:
-        r = requests.post(
+        r = _SESSION.post(
             PLACES_NEW_SEARCH_TEXT_URL,
             headers=headers,
             data=json.dumps(body),
-            timeout=REQUEST_TIMEOUT_SEC,
+            timeout=_REQ_TIMEOUT,
         )
     except requests.RequestException as exc:
         log.info("Places (New) searchText network error: %s", exc)
@@ -623,11 +694,11 @@ def _places_new_autocomplete_route(
         # Default field mask returns the structured suggestion text.
     }
     try:
-        r = requests.post(
+        r = _SESSION.post(
             PLACES_NEW_AUTOCOMPLETE_URL,
             headers=headers,
             data=json.dumps(body),
-            timeout=REQUEST_TIMEOUT_SEC,
+            timeout=_REQ_TIMEOUT,
         )
     except requests.RequestException as exc:
         log.info("Places (New) autocomplete network error for %r: %s", street_name, exc)
@@ -719,7 +790,7 @@ def _here_geocode(
         params["at"] = at_param
 
     try:
-        r = requests.get(HERE_GEOCODE_URL, params=params, timeout=REQUEST_TIMEOUT_SEC)
+        r = _SESSION.get(HERE_GEOCODE_URL, params=params, timeout=_REQ_TIMEOUT)
     except requests.RequestException as exc:
         log.info("HERE network error: %s", exc)
         return None
@@ -823,12 +894,7 @@ def _overpass_motorway_junction(
         "out 5;\n"
     )
     try:
-        r = requests.post(
-            OVERPASS_URL,
-            data={"data": ql},
-            timeout=OVERPASS_TIMEOUT_SEC,
-            headers={"User-Agent": "Ellen (Quality Counts) traffic-study intake"},
-        )
+        r = _SESSION.post(OVERPASS_URL, data={"data": ql}, timeout=_OVERPASS_TIMEOUT)
         r.raise_for_status()
         data = r.json()
     except Exception as exc:
@@ -876,41 +942,51 @@ def _intersection_chain(
 ) -> Optional[GeocodeResult]:
     """Walk the intersection-aware chain with SHAPE ROUTING.
 
-    Rebuilt 2026-05-25 after live HERE eval (16/16 on Pittsboro vs 0-2/16
-    for the prior Places-based chain). Two big changes from prior:
-      - Places searchText / Find Place tiers DROPPED — they produced
-        "pins in fields" (POI-near-streets, not intersections)
-      - HERE Geocoder added as Tier 4 — 16/16 hit rate including
-        ramps/interchanges that OSM doesn't tag
+    Trimmed 2026-05-25 PM after Zephyrhills trace showed Tier 2 (Places
+    Autocomplete) burning 81s on a single Overpass-miss address. The
+    autocomplete tier was a "bridge" — canonicalize street names, then
+    retry Overpass — but HERE (Tier 4) handles fuzzy LLM-typed names
+    natively, so the bridge isn't earning its 80s cost. Dropped Tier 2 +
+    Tier 3 entirely; chain is now strictly Overpass-then-HERE.
 
-    Routing by input shape:
-      - INTERCHANGE (street contains Ramp/Exit/I-/US/SR/Hwy/Route):
-          Tier 1b (Overpass motorway_junction) → Tier 4 (HERE)
-          Skips Tier 1 + 3 (guaranteed to miss for ramps)
-      - INTERSECTION (standard cross-street):
-          Tier 1 → Tier 2+3 (Autocomplete + retry Overpass) → Tier 4 (HERE)
+    Order (accuracy-first):
+      INTERSECTION:  Tier 1 (Overpass intersection-node) → Tier 4 (HERE)
+      INTERCHANGE:   Tier 1b (Overpass motorway_junction) → Tier 4 (HERE)
 
-    Order summary (accuracy-first):
-      1. Overpass intersection-node (raw)    — FREE, exact for standard intersections
-      1b. Overpass motorway_junction         — FREE, exact for tagged ramps (interchange-shape only)
-      2. Autocomplete each street            — paid (~$0.006/pair); canonicalize
-      3. Overpass intersection-node (canonical) — FREE retry with corrected names
-      4. HERE Geocoder                       — paid (~$0.001/call, free 1k/day); best coverage
+      1.  Overpass intersection-node          — FREE, exact for standard intersections
+      1b. Overpass motorway_junction          — FREE, exact for tagged ramps
+      4.  HERE Geocoder                       — ~$0.001/call (free 1k/day); best coverage
 
-    Returns first hit. None if every tier missed → caller falls to LLM text estimate.
+    Returns first hit. None if every tier missed → caller falls to LLM
+    text estimate.
+
+    The autocomplete functions (`_places_new_autocomplete_route`) are
+    retained in the module for now in case HERE coverage regresses and
+    the bridge is needed back. Re-introducing them just means wiring two
+    timed() blocks between the Overpass and HERE tiers.
     """
+    from . import trace_log  # local import — avoid module-load circularity
+
     street_a, street_b = parsed["street_a"], parsed["street_b"]
     city, state = parsed["city"], parsed["state"]
+    addr_tag = f"{street_a} & {street_b}, {city}, {state}"
 
     # Resolve the city bbox once up-front. Cached after the first lookup
     # per process, so emails with multiple intersections in the same city
-    # only pay this Geocoding call once.
-    bbox = _locality_bbox(city, state, api_key)
+    # only pay this Geocoding call once. Note: in the extractor, the bboxes
+    # for all unique (city, state) pairs are pre-warmed sequentially BEFORE
+    # the threadpool launches, so worker threads see a cache hit here
+    # rather than blocking ~40s on a cold first call.
+    with trace_log.timed("geocoder.bbox_lookup", city=city, state=state) as t:
+        bbox = _locality_bbox(city, state, api_key)
+        t["bbox_resolved"] = bbox is not None
     is_interchange = _is_interchange_shaped(parsed)
 
     # ---- Tier 1: Overpass intersection-node (skipped for interchanges) ----
     if not is_interchange:
-        result = _overpass_intersection(street_a, street_b, city, state, bbox=bbox)
+        with trace_log.timed("geocoder.tier", phase="overpass_raw", address=addr_tag) as t:
+            result = _overpass_intersection(street_a, street_b, city, state, bbox=bbox)
+            t["hit"] = result is not None
         if result is not None:
             log.info("Tier 1 (Overpass raw) HIT %r × %r in %s — exact node.",
                      street_a, street_b, city)
@@ -918,38 +994,24 @@ def _intersection_chain(
 
     # ---- Tier 1b: Overpass motorway_junction (interchanges only) ----
     if is_interchange:
-        result = _overpass_motorway_junction(street_a, street_b, city, state, bbox=bbox)
+        with trace_log.timed("geocoder.tier", phase="overpass_motorway_junction", address=addr_tag) as t:
+            result = _overpass_motorway_junction(street_a, street_b, city, state, bbox=bbox)
+            t["hit"] = result is not None
         if result is not None:
             log.info("Tier 1b (Overpass motorway_junction) HIT %r × %r in %s — exact ramp node.",
                      street_a, street_b, city)
-            return result
-
-    # ---- Tier 2: Autocomplete each street (skipped for interchanges — Google
-    # autocomplete doesn't help with ramp names; saves ~$0.006 + ~2s per address) ----
-    canonicalized = False
-    canon_a, canon_b = street_a, street_b
-    if not is_interchange:
-        canon_a = _places_new_autocomplete_route(street_a, bbox, api_key) or street_a
-        canon_b = _places_new_autocomplete_route(street_b, bbox, api_key) or street_b
-        canonicalized = (canon_a, canon_b) != (street_a, street_b)
-        if canonicalized:
-            log.info("Autocomplete canonicalized: %r → %r ; %r → %r",
-                     street_a, canon_a, street_b, canon_b)
-
-    # ---- Tier 3: Overpass with canonical names ----
-    if canonicalized:
-        result = _overpass_intersection(canon_a, canon_b, city, state, bbox=bbox)
-        if result is not None:
-            log.info("Tier 3 (Overpass canonical) HIT %r × %r in %s — exact node.",
-                     canon_a, canon_b, city)
             return result
 
     # ---- Tier 4: HERE Geocoder ----
     # Best coverage for interchanges + LLM-mis-named streets. Returns
     # tagged-tier coords (intersection / street / houseNumber); confidence
     # mapping in GeocodeResult.confidence handles the gradient.
-    here_query = f"{canon_a} and {canon_b}, {city}, {state}"
-    result = _here_geocode(here_query, city=city, state=state)
+    here_query = f"{street_a} and {street_b}, {city}, {state}"
+    with trace_log.timed("geocoder.tier", phase="here", address=addr_tag) as t:
+        result = _here_geocode(here_query, city=city, state=state)
+        t["hit"] = result is not None
+        if result is not None:
+            t["result_type"] = result.location_type
     if result is not None:
         log.info("Tier 4 (HERE) HIT for %r in %s — resultType=%s",
                  here_query, city, result.location_type)
@@ -964,14 +1026,34 @@ def _intersection_chain(
 
 
 def geocode(address: str, *, api_key: Optional[str] = None) -> Optional[GeocodeResult]:
-    """Resolve `address` to lat/lon using the most-accurate-first chain.
+    """Thin wrapper around `_geocode_impl` that emits a per-address
+    `geocoder.address_total` trace event with total wall time + final
+    source tier (or `miss` if all tiers failed). Combined with the
+    per-tier events from `_intersection_chain`, this gives a complete
+    breakdown for every address.
+    """
+    from . import trace_log
+    with trace_log.timed("geocoder.address_total", address=address) as t:
+        try:
+            result = _geocode_impl(address, api_key=api_key)
+        except Exception as exc:
+            t["error"] = f"{type(exc).__name__}: {exc}"
+            raise
+        if result is None:
+            t["outcome"] = "miss"
+        else:
+            t["outcome"] = "hit"
+            t["source"] = result.location_type
+            t["confidence"] = result.confidence
+        return result
 
-    Dispatch:
+
+def _geocode_impl(address: str, *, api_key: Optional[str] = None) -> Optional[GeocodeResult]:
+    """Internal implementation. Dispatch:
       - If the address parses as "<X> and <Y>, <city>, <state>" → run the
-        INTERSECTION chain: Overpass (OSM) → Places (New) searchText →
-        Autocomplete-canonicalize + retry. Each tier hits a strictly more
-        permissive / more expensive matcher than the previous; first
-        success wins.
+        INTERSECTION chain: Overpass (OSM) → Autocomplete → Overpass-canonical
+        → HERE. Each tier hits a strictly more permissive / more expensive
+        matcher than the previous; first success wins.
       - On miss from the intersection chain (or for non-intersection
         addresses like single street numbers), fall back to the LEGACY
         chain: Geocoding API variants → Places Find Place → APPROXIMATE
@@ -1078,7 +1160,7 @@ def _places_find_once(address: str, key: str) -> Optional[GeocodeResult]:
         "key": key,
     }
     try:
-        r = requests.get(PLACES_FIND_PLACE_URL, params=params, timeout=REQUEST_TIMEOUT_SEC)
+        r = _SESSION.get(PLACES_FIND_PLACE_URL, params=params, timeout=_REQ_TIMEOUT)
         r.raise_for_status()
     except requests.RequestException as exc:
         raise GeocodingError(f"Network error calling Places API: {exc}") from exc
@@ -1110,7 +1192,7 @@ def _geocode_once(address: str, key: str) -> Optional[GeocodeResult]:
     """Single Geocoding API call. Returns None on ZERO_RESULTS, raises on errors."""
     params = {"address": address, "key": key}
     try:
-        r = requests.get(GEOCODE_URL, params=params, timeout=REQUEST_TIMEOUT_SEC)
+        r = _SESSION.get(GEOCODE_URL, params=params, timeout=_REQ_TIMEOUT)
         r.raise_for_status()
     except requests.RequestException as exc:
         raise GeocodingError(f"Network error calling Geocoding API: {exc}") from exc
