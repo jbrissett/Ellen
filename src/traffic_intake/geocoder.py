@@ -763,7 +763,15 @@ def _intersection_chain(
 def geocode(address: str, *, api_key: Optional[str] = None) -> Optional[GeocodeResult]:
     """Resolve `address` to lat/lon using the most-accurate-first chain.
 
-    Dispatch:
+    Cache-first (Phase 1 speed work, branch speed-geocoder-cache 2026-05-26):
+      - Look up the normalized address in the persistent JSONL cache.
+        Same intersection asked twice = the second time is ~0ms.
+        Cache is order-insensitive ("A and B" == "B and A") and handles
+        the "& / and / at" connector variants.
+      - On miss, run the full chain (intersection-aware → legacy), then
+        store the result for next time.
+
+    Chain dispatch:
       - If the address parses as "<X> and <Y>, <city>, <state>" → run the
         INTERSECTION chain: Overpass (OSM) → Places (New) searchText →
         Autocomplete-canonicalize + retry. Each tier hits a strictly more
@@ -777,6 +785,17 @@ def geocode(address: str, *, api_key: Optional[str] = None) -> Optional[GeocodeR
     Returns None only if EVERYTHING failed. Raises on hard errors
     (auth/billing) that persisted across every attempt.
     """
+    # Cache hit short-circuits the whole chain. Important: do this BEFORE
+    # the API-key check — cached results don't need a key (they were
+    # geocoded previously when the key was valid). This lets cached
+    # results still work even after a key expires / rotates.
+    from . import geocode_cache
+    cached = geocode_cache.lookup(address)
+    if cached is not None:
+        log.info("geocode cache HIT for %r → %.5f, %.5f (%s)",
+                 address, cached.latitude, cached.longitude, cached.location_type)
+        return cached
+
     key = api_key or get_google_geocoding_key()
     if not key:
         raise GeocoderUnavailable(
@@ -796,6 +815,7 @@ def geocode(address: str, *, api_key: Optional[str] = None) -> Optional[GeocodeR
                         type(exc).__name__, exc)
             result = None
         if result is not None:
+            geocode_cache.store(address, result)
             return result
         log.info(
             "Intersection chain missed for %r — falling through to legacy "
@@ -830,6 +850,7 @@ def geocode(address: str, *, api_key: Optional[str] = None) -> Optional[GeocodeR
         # Real intersection-grade hit.
         if i > 1:
             log.info("Geocoder succeeded on variant %d/%d: %r", i, len(variants), query)
+        geocode_cache.store(address, result)
         return result
 
     # Step 2: Places find-place fallback on the ORIGINAL address. Places
@@ -838,6 +859,7 @@ def geocode(address: str, *, api_key: Optional[str] = None) -> Optional[GeocodeR
         places_result = _places_find_once(address, key)
         if places_result is not None:
             log.info("Places find-place succeeded after Geocoding variants failed: %r", address)
+            geocode_cache.store(address, places_result)
             return places_result
     except GeocodingError as exc:
         log.info("Places find-place fallback failed (%s)", exc)
@@ -848,6 +870,12 @@ def geocode(address: str, *, api_key: Optional[str] = None) -> Optional[GeocodeR
     # which lets the user nudge it to the right intersection manually.
     if approximate_fallback is not None:
         log.info("Falling back to APPROXIMATE Geocoding result: %s", approximate_fallback.formatted_address)
+        # Cache the APPROXIMATE fallback too — better a fast city-level
+        # pin than re-running the whole chain to land at the same place.
+        # If the user manually corrects the pin later, they can clear
+        # the cache (python -m traffic_intake.geocode_cache --clear)
+        # to force a re-geocode.
+        geocode_cache.store(address, approximate_fallback)
         return approximate_fallback
 
     if last_error is not None:
