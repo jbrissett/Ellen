@@ -1,0 +1,81 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+.installed.cfg
+.Python
+build/
+dist/
+sdist/
+wheels/
+*.whl
+*.tar.gz
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# ---------- Virtual envs ----------
+.venv/
+venv/
+env/
+ENV/
+
+# ---------- IDEs ----------
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+
+# ---------- OS ----------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---------- Secrets ----------
+# API keys are baked into the installer at BUILD time via a substitution
+# step, not committed. Never check in a .env, an `api_key.txt`, or any
+# file that hardcodes an Anthropic / Google key.
+.env
+.env.*
+*api_key*
+*credentials*
+*secrets*
+config.local.*
+
+# ---------- Local dev data ----------
+# Real client emails — PII. Keep these out of version control even on
+# a private repo. Add an `samples-shared/` folder for de-identified
+# fixtures if/when you want them tracked.
+samples/
+
+# Frame-by-frame qchub UI screenshots — debugging artifacts, 11MB.
+qchub-frames/
+
+# PyInstaller / Inno Setup build output (the installer pieces live in
+# `installer/` source, but compiled artifacts go in dist/build/ above).
+installer/Output/
+installer/*.iss.bak
+
+# ---------- App-runtime artifacts (live OUTSIDE the repo by default,
+# but in case anyone runs the app from the project dir for dev) ----------
+*.log
+run-*/
+run.log
+diagnostics/
+mymaps-diagnostics/
+qchub-diagnostics/
+
+# ---------- Editor backups ----------
+*.bak
+*.orig
+*~

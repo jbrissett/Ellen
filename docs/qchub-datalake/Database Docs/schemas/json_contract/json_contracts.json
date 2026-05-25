@@ -1,0 +1,20 @@
+{
+    "contracts": [
+        {
+        "description": "Datalens source_summary.volume_by_movement table, volume_count_by_class field (JSONB)",
+        "additional_description": "Mapping of vehicle class ID based on file_id and file_summary_capability table -  mapping file to bin scheme",
+        "source": "vehicle_classes table",
+        "contract": {
+            "type": "object",
+            "description": "Mapping of vehicle class ID to volume count -- e.g., for datalens files use datalens_alias { 'cl2_passenger_car': 23, 'cl12_truck_multi_traile': 45 }",
+            "properties": {
+                "$class identifier": {
+                    "type": "integer",
+                    "description": "Volume count for the vehicle class identified by datalens alias"
+                }
+            },
+            "required": ["vehicle_class_id", "volume_count"]
+            }
+        }
+    ]     
+}

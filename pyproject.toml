@@ -1,0 +1,31 @@
+[project]
+name = "traffic-intake"
+version = "0.1.0"
+description = "Parse traffic study request emails and route them through the QC order pipeline."
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.40.0",
+    "extract-msg>=0.50.0",
+    "pydantic>=2.9.0",
+    "requests>=2.32.0",
+    "keyring>=25.0.0",
+    "python-dateutil>=2.9.0",
+    "beautifulsoup4>=4.12.0",
+]
+
+[project.scripts]
+traffic-intake = "traffic_intake.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# Ship the splash logo (and any future static UI assets) alongside the
+# Python code so installed copies of the package can find them via
+# `Path(__file__).parent / "assets" / "qc_logo.png"`. Without this,
+# the package install drops them and the splash falls back to text.
+[tool.setuptools.package-data]
+"traffic_intake.ui" = ["assets/*.png", "assets/*.jpg", "assets/*.svg"]

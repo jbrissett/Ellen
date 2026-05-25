@@ -1,0 +1,5 @@
+# Dev-only dependencies — NOT shipped with the installed app.
+# Install via: .venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+# Or just double-click tools\Run Regression Tests.bat (auto-installs on first run).
+
+pytest>=9.0.0
