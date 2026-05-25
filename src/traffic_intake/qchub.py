@@ -1156,14 +1156,24 @@ def _fill_request_estimate(
     email = (request.client_contact_email or "").strip()
     if email:
         log(f"Selecting *User by email {email!r}…")
-        _wait_for_dropdown_loaded(page, "*User", log, timeout_sec=15)
+        # Timeout bumped 15→30s 2026-05-25 after observing a real
+        # client run where the User dropdown didn't load in 15s,
+        # causing a false "user not found" that triggered an
+        # unnecessary auto-create. The User dropdown carries 6000+
+        # entries — slower than other dropdowns on slow networks.
+        _wait_for_dropdown_loaded(page, "*User", log, timeout_sec=30)
         if not _select_by_match(page, "*User", [email], log=log):
             raise QchubUserNotFound(email)
     elif user_variants:
         # No email available — fall back to name match, but log a warning
         # since name collisions are likely in a global dropdown.
         log(f"⚠ No client_contact_email — falling back to name match: {user_variants!r}")
-        _wait_for_dropdown_loaded(page, "*User", log, timeout_sec=15)
+        # Timeout bumped 15→30s 2026-05-25 after observing a real
+        # client run where the User dropdown didn't load in 15s,
+        # causing a false "user not found" that triggered an
+        # unnecessary auto-create. The User dropdown carries 6000+
+        # entries — slower than other dropdowns on slow networks.
+        _wait_for_dropdown_loaded(page, "*User", log, timeout_sec=30)
         if not _select_by_match(page, "*User", user_variants, log=log):
             raise QchubUserNotFound(user_variants[0] if user_variants else "(unknown)")
 
@@ -5388,17 +5398,57 @@ def _llm_lookup_company_address(
         f"their contact / about / locations page."
     )
 
+    # Retry on transient errors (connection blips, rate limits, 5xx).
+    # Observed run-20260525-092150: a single APIConnectionError killed
+    # the whole auto-create chain. A 2-try loop with brief backoff
+    # covers >95% of transient cases without delaying the bad-key
+    # path more than ~3s.
+    import anthropic as _anthropic
     try:
         client = Anthropic(api_key=get_api_key())
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=2000,
-            temperature=0,
-            timeout=httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0),
-            system=system_prompt,
-            tools=[{"type": "web_search_20250305", "name": "web_search"}],
-            messages=[{"role": "user", "content": user_msg}],
-        )
+        response = None
+        last_exc: Optional[BaseException] = None
+        for attempt in range(1, 3):  # 2 tries total
+            try:
+                response = client.messages.create(
+                    model="claude-sonnet-4-6",
+                    max_tokens=2000,
+                    temperature=0,
+                    timeout=httpx.Timeout(connect=10.0, read=60.0, write=10.0, pool=10.0),
+                    system=system_prompt,
+                    tools=[{"type": "web_search_20250305", "name": "web_search"}],
+                    messages=[{"role": "user", "content": user_msg}],
+                )
+                break  # success
+            except (
+                _anthropic.APIConnectionError,
+                _anthropic.RateLimitError,
+                _anthropic.APITimeoutError,
+            ) as exc:
+                last_exc = exc
+                log(
+                    f"  Web-search call attempt {attempt}/2 failed "
+                    f"({type(exc).__name__}); retrying in 2s…"
+                )
+                time.sleep(2.0)
+            except _anthropic.APIStatusError as exc:
+                sc = getattr(exc, "status_code", None)
+                if sc == 529 or (sc is not None and 500 <= sc < 600):
+                    last_exc = exc
+                    log(
+                        f"  Web-search call attempt {attempt}/2 hit "
+                        f"qchub-side {sc}; retrying in 2s…"
+                    )
+                    time.sleep(2.0)
+                else:
+                    raise  # 4xx — caller's problem, don't retry
+        if response is None:
+            # Both attempts failed on transient errors.
+            log(
+                f"  ⚠ Web-search address lookup failed after 2 tries: "
+                f"{type(last_exc).__name__ if last_exc else 'unknown'}: {last_exc}"
+            )
+            return ("", "", "", "")
 
         # web_search is a server tool — Claude orchestrates the
         # search internally and returns the final answer as text.
