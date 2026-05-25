@@ -4646,6 +4646,92 @@ def read_existing_companies_via_admin(page: Page, log: ProgressCallback) -> list
     return real_opts
 
 
+def peek_user_form_company_options(page: Page, log: ProgressCallback) -> list[str]:
+    """Open the Add Client User modal momentarily to read the CompanyID
+    dropdown options, then cancel. Returns the option text list.
+
+    Replaces `read_existing_companies_via_admin` as the source of truth
+    for "does company X exist in qchub" — per user direction 2026-05-25,
+    the /Admin/Companies search box is unreliable, but the User form's
+    CompanyID dropdown is the dropdown we have to query anyway (to
+    pick the company when saving the user). Using it for the existence
+    check is a single source of truth.
+
+    Note: this dropdown is slightly larger than ParentCompanyID
+    (~3000+ options vs ~2500) because it includes archived companies.
+    Fuzzy match should be tolerant of that — an archived "Kimley-Horn
+    — Old Office" is a match for a current "Kimley-Horn" request.
+    """
+    log(f"Peeking CompanyID options in Add Client User modal at {_ADMIN_USERS_URL}…")
+    if "/Admin/Users" not in page.url:
+        page.goto(_ADMIN_USERS_URL, wait_until="domcontentloaded")
+        page.wait_for_timeout(800)
+    _dismiss_unsaved_changes_prompt(page, log)
+    _close_kendo_dialogs_gracefully(page, log)
+
+    # Ensure Client Users tab is active (mirror of the same step in
+    # create_client_user_via_admin).
+    try:
+        active_tab = page.locator(".tab-lnk.active, a.active").filter(
+            has_text=re.compile(r"Client\s+Users", re.IGNORECASE)
+        ).first
+        if not active_tab.is_visible(timeout=2_000):
+            inactive_tab = page.locator(".tab-lnk").filter(
+                has_text=re.compile(r"Client\s+Users", re.IGNORECASE)
+            ).first
+            inactive_tab.click(timeout=3_000)
+            page.wait_for_timeout(500)
+    except Exception:
+        pass
+
+    # Click Add Client User
+    try:
+        add_btn = page.get_by_role(
+            "button", name=re.compile(r"add\s*client\s*user", re.IGNORECASE)
+        ).first
+        add_btn.click(timeout=8_000)
+    except Exception as exc:
+        log(f"⚠ Couldn't open Add Client User modal to peek company options: {exc}")
+        return []
+
+    modal = _add_user_modal_locator(page)
+    try:
+        modal.wait_for(state="visible", timeout=10_000)
+    except Exception:
+        log("⚠ Add Client User modal didn't render within 10s — can't peek company options.")
+        return []
+
+    # Read CompanyID options (async-populated; poll until stable)
+    try:
+        company_select = modal.locator('select[name="CompanyID"]').first
+        company_select.wait_for(state="attached", timeout=5_000)
+        opts = _wait_for_select_options_loaded(
+            company_select, log,
+            min_options=100, timeout_sec=15.0,
+            label="User-form CompanyID (peek)",
+        )
+    except Exception as exc:
+        log(f"⚠ Couldn't read CompanyID options during peek: {exc}")
+        opts = []
+
+    real_opts = [o.strip() for o in opts if o.strip()]
+    log(f"  Peek read {len(real_opts)} CompanyID option(s).")
+
+    # Cancel the modal — nothing was typed so cancel is clean.
+    try:
+        cancel_btn = modal.locator("button.btn.site-btn-inverse").filter(
+            has_text=re.compile(r"^\s*cancel\s*$", re.IGNORECASE)
+        ).first
+        cancel_btn.click(timeout=3_000)
+        page.wait_for_timeout(400)
+    except Exception as exc:
+        log(f"  (cancel after peek failed: {exc}; attempting Escape)")
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(400)
+    _dismiss_unsaved_changes_prompt(page, log)
+    return real_opts
+
+
 def _fill_add_company_modal(modal, page: Page, info: CompanyInfo, log: ProgressCallback) -> bool:
     """Fill every required field in the Add Company modal. Returns True
     if all fields filled cleanly + lat/long auto-populated; False on
@@ -5184,14 +5270,21 @@ def create_client_user_via_admin(
         )
         real_opts = [o.strip() for o in opts if o.strip()]
         matches = find_company_near_matches(info.company_match_text, real_opts, max_matches=1)
-        if not matches:
+        best = matches[0] if matches else None
+        # Threshold 0.80 (per user direction 2026-05-25): bind silently
+        # to a high-confidence match (likely a branch / city variant of
+        # the same company), reject anything weaker to avoid landing
+        # the order on a wrong-firm namesake.
+        if best is None or best.score < 0.80:
+            best_score = best.score if best else 0.0
             log(
-                f"⚠ Couldn't find company {info.company_match_text!r} in "
-                f"CompanyID dropdown (read {len(real_opts)} options)"
+                f"⚠ No acceptable CompanyID match for {info.company_match_text!r} "
+                f"(best score: {best_score:.2f}; "
+                f"threshold ≥ 0.80; read {len(real_opts)} options)"
             )
             return False
-        company_select.select_option(label=matches[0].option_text, timeout=3_000)
-        log(f"  Picked Company: {matches[0].option_text!r} (score {matches[0].score:.2f})")
+        company_select.select_option(label=best.option_text, timeout=3_000)
+        log(f"  Picked Company: {best.option_text!r} (score {best.score:.2f})")
     except Exception as exc:
         log(f"⚠ Couldn't pick company: {exc}")
         return False
@@ -5615,29 +5708,42 @@ def auto_create_for_missing_entity(
     else:
         log(f"  Phone (from signature): {phone}")
 
-    # --- COMPANY: check first; only resolve address if we have to create ---
-    # IMPORTANT (per user direction 2026-05-25): the address resolution
-    # (regex + web-search) was previously running unconditionally — even
-    # when the company already existed in qchub and we only needed to
-    # add a user. The User form has NO address fields, so that work was
-    # wasted, and worse: a transient web-search APIConnectionError
-    # would bail the whole orchestrator and block the user create too.
-    # Observed run-20260525-092150 with Kimley-Horn / Kevin Dean.
+    # --- COMPANY: check via User-form CompanyID dropdown (Branch A: single-tab) ---
+    # Per user direction 2026-05-25, use the User-form CompanyID
+    # dropdown as the source of truth for company existence — the
+    # /Admin/Companies search box is unreliable. The CompanyID
+    # dropdown is the one we have to consult anyway to save the user.
     #
-    # New order: check company existence FIRST. Only resolve the
-    # address if we'll actually create a new company.
-    log(f"--- Company step: {name!r} ---")
-    existing = read_existing_companies_via_admin(page, log)
+    # Silent-bind threshold: 0.80. High-confidence matches (likely a
+    # branch / city variant of the same firm — e.g., "Kimley-Horn —
+    # Charlotte" matching a "Kimley-Horn" request) get bound to the
+    # existing entry; the user sees a notification in the run log.
+    # Anything weaker triggers the pivot to create a new company.
+    log(f"--- Company step (Branch A: single-tab): {name!r} ---")
+    existing = peek_user_form_company_options(page, log)
     near = find_company_near_matches(name, existing, max_matches=5)
-    exact = [m for m in near if m.score == 1.0]
-    if exact:
-        company_match = exact[0].option_text
-        log(f"  Company already exists as {company_match!r} — skipping create + address lookup.")
+    best = near[0] if near else None
+    SILENT_MATCH_THRESHOLD = 0.80
+
+    if best and best.score >= SILENT_MATCH_THRESHOLD:
+        company_match = best.option_text
+        if best.score >= 1.0:
+            log(f"  Company exact match: {company_match!r} — skipping company create.")
+        else:
+            # User direction: silent match + notify. Log loudly so the
+            # near-match is visible in chat status after the fact.
+            log(
+                f"  ⚠ Near-match silent bind: {company_match!r} (score {best.score:.2f}) "
+                f"for requested {name!r}. Verify if this is the wrong branch/firm; "
+                f"otherwise proceeding with this existing entry (no new company created)."
+            )
     else:
-        # Need to create a new company — NOW resolve the address.
+        # No acceptable match — create the company first.
+        best_score = best.score if best else 0.0
         log(
-            "  Company not in qchub — resolving address before create "
-            "(regex Tier 1, then web search Tier 2 if Tier 1 incomplete)."
+            f"  No match for {name!r} in CompanyID dropdown "
+            f"(best: {best_score:.2f}; threshold ≥ {SILENT_MATCH_THRESHOLD}). "
+            f"Resolving address + creating company first."
         )
         address_1, city, state, zip_code = extract_address_from_signature(body)
         if not all((address_1, city, state, zip_code)):
@@ -5647,7 +5753,6 @@ def auto_create_for_missing_entity(
                 f"zip={zip_code!r}) — trying web search for {name!r}."
             )
             w_street, w_city, w_state, w_zip = _llm_lookup_company_address(name, email, log)
-            # OR-fill: keep any partial fields the regex got, fill gaps from web.
             address_1 = address_1 or w_street
             city = city or w_city
             state = state or w_state
@@ -5663,18 +5768,18 @@ def auto_create_for_missing_entity(
             return False
         log(f"  Address resolved: {address_1}, {city}, {state} {zip_code}")
 
-        # Silent-create. Log near-matches loudly so dupes are visible.
-        if near:
-            log(
-                f"⚠ Near-matches found but proceeding with new entry "
-                f"(per silent-create policy). Closest existing: "
-                + ", ".join(f"{m.option_text!r} (score {m.score:.2f})" for m in near)
-            )
         company_info = CompanyInfo(
             name=name, email=email, phone=_format_phone_for_qchub(phone),
             address_1=address_1, address_2="",
             city=city, state=state, zip_code=zip_code,
         )
+        # BRANCH A: drive company-create on the SAME page (Playwright tab)
+        # that the orchestrator was handed. `create_company_via_admin`
+        # navigates to /Admin/Companies and does the work there.
+        # Cancel any leftover Add Client User kendo dialog from the peek
+        # (defensive — peek_user_form_company_options should have done so
+        # but belt-and-suspenders).
+        _close_kendo_dialogs_gracefully(page, log)
         company_match = create_company_via_admin(page, company_info, log, run_dir=run_dir)
         if not company_match:
             log(f"⚠ Auto-create FAILED for company {name!r} — falling back to manual modal.")
