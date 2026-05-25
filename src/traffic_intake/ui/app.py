@@ -31,6 +31,16 @@ from .chat_panel import ChatPanel
 from .drop_zone import DropZone
 from .extraction_panel import ExtractionPanel
 from .floating_reply import FloatingReplyWidget
+
+# Floating reply widget is disabled 2026-05-25 after a hard Qt6Core
+# access-violation crash (0xc0000005) was traced to the moment Ellen's
+# warmup turn finished and the widget would attempt to construct/show
+# from the chat-finished signal. Likely a Qt thread-safety issue with
+# the worker→UI handoff; needs investigation before re-enabling.
+# Set this back to True to restore the widget once the threading
+# issue is properly fixed (would also need to be on a branch + stress-
+# tested per test-ship-test). Tray notifications still fire either way.
+FLOATING_REPLY_ENABLED = False
 from .outlook_picker import NoSelection, OutlookUnavailable, import_selected_email
 from .settings_dialog import SettingsDialog
 from .workers import run_chat, run_email_draft, run_extraction, run_mymaps_creation, run_qchub_creation
@@ -163,7 +173,15 @@ class MainWindow(QMainWindow):
         history ends with '?' (after stripping trailing whitespace).
         Quick to ship; if it gets noisy we can tighten later (e.g.,
         require a tool that explicitly marks the question).
+
+        GATED on FLOATING_REPLY_ENABLED — currently False after a Qt
+        crash 2026-05-25. The body below runs only when re-enabled;
+        otherwise this is a no-op. Tray notifications still fire from
+        the per-job handlers (_on_mymaps_finished, _on_qchub_finished,
+        etc.) so the user isn't left in silence.
         """
+        if not FLOATING_REPLY_ENABLED:
+            return
         if self.isActiveWindow():
             return  # user is looking at the app — no popup needed
         last_assistant_text = self._extract_last_assistant_text()
