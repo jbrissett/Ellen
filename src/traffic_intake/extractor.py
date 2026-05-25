@@ -554,12 +554,12 @@ def _refine_estimates_via_geocoding(request: StudyRequest) -> None:
     sees a clear "N of M addresses needed manual verification" warning surfaced
     via the location's `estimate.notes`.
     """
-    # 90s cap (was 120) — per-address worst case is ~70s under the 5-tier
-    # chain (Overpass 10s + Autocomplete×2 20s + Overpass canonical 10s +
-    # Places×3 30s), parallelized across all addresses. 90s gives the
-    # slowest single address full headroom but bails on a stuck batch
-    # fast enough that the user doesn't sit watching a spinner for 2 minutes.
-    PHASE_BUDGET_SEC = 90
+    # 45s cap (was 90) — chain trimmed 2026-05-25 PM to Overpass → HERE
+    # only. Per-address worst case is now ~20s (Overpass 10s + HERE 10s),
+    # parallelized across all addresses. 45s gives a stuck batch room to
+    # finish but bails fast enough that the user doesn't watch a spinner
+    # for a minute on a single bad address.
+    PHASE_BUDGET_SEC = 45
 
     try:
         api_key = geocoder.get_google_geocoding_key()
@@ -592,6 +592,18 @@ def _refine_estimates_via_geocoding(request: StudyRequest) -> None:
     # the address-count split, without having to aggregate per-tier events.
     from . import trace_log
     from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    # Pre-warm city bboxes sequentially BEFORE launching workers. Without
+    # this, every worker's first call into `_locality_bbox` blocks ~40s
+    # on a cold Google Geocoding call (the dedupe lock saves the duplicate
+    # API call but not the wait — thread 2..N all wait for thread 1). One
+    # sequential pass means every worker sees a cache hit on entry.
+    # Observed Zephyrhills trace 2026-05-25: 2 parallel workers both showed
+    # 40.7s bbox_lookup; one pre-warm pass collapses that to ~40s once,
+    # then ~0ms per worker.
+    with trace_log.timed("geocoder.bbox_prewarm", n_addresses=len(work)) as t:
+        unique_cities = geocoder.prewarm_bboxes([a for _, a in work], api_key)
+        t["unique_cities"] = unique_cities
 
     geocoded_high = 0
     geocoded_medium = 0
