@@ -546,7 +546,16 @@ def _refine_estimates_via_geocoding(request: StudyRequest) -> None:
     LLM vision/text_only estimates are useful for *identifying* which intersection
     the client meant; Google's geocoder is what gives accurate map pins.
     Failures here are non-fatal — we keep whatever the LLM provided and log a note.
+
+    Parallelized 2026-05-25 (Winchester VA email hung 5+ minutes on sequential
+    lookups). Each location's geocode runs on its own thread. We hard-cap the
+    whole phase at PHASE_BUDGET_SEC — any thread still running at the deadline
+    is abandoned and its location keeps the LLM-estimated coordinates. The user
+    sees a clear "N of M addresses needed manual verification" warning surfaced
+    via the location's `estimate.notes`.
     """
+    PHASE_BUDGET_SEC = 120  # generous cap; healthy parallel case finishes in <15s
+
     try:
         api_key = geocoder.get_google_geocoding_key()
     except Exception:
@@ -555,38 +564,95 @@ def _refine_estimates_via_geocoding(request: StudyRequest) -> None:
         log.info("No Google Geocoding API key — keeping LLM-estimated coordinates.")
         return
 
-    geocoded = 0
+    # Build the work list. Locations with KMZ-sourced coords are trusted and
+    # skipped here (we don't waste an API call). Locations with no address
+    # string can't be geocoded — flagged and skipped.
+    work: list[tuple[int, str]] = []  # (index_in_request.locations, address)
     skipped_kmz = 0
-    failed = 0
-    for loc in request.locations:
+    no_address = 0
+    for idx, loc in enumerate(request.locations):
         if loc.estimate and loc.estimate.source == "kmz":
-            # Trust client-provided KMZ coords; don't waste an API call.
             skipped_kmz += 1
             continue
         if not loc.address_or_intersection:
-            failed += 1
+            no_address += 1
             continue
-        try:
-            result = geocoder.geocode(loc.address_or_intersection, api_key=api_key)
-        except (geocoder.GeocodingError, geocoder.GeocoderUnavailable) as exc:
-            log.warning("Geocode failed for %r: %s", loc.address_or_intersection, exc)
-            failed += 1
-            continue
-        if result is None:
-            log.info("No geocoding results for %r", loc.address_or_intersection)
-            failed += 1
-            continue
-        loc.estimate = LocationEstimate(
-            latitude=result.latitude,
-            longitude=result.longitude,
-            confidence=result.confidence,
-            source="geocoded",
-            notes=f"Google Geocoding: {result.formatted_address} ({result.location_type})",
-        )
-        geocoded += 1
+        work.append((idx, loc.address_or_intersection))
 
-    log.info("Geocoder summary: %d geocoded, %d skipped (KMZ source), %d failed.",
-             geocoded, skipped_kmz, failed)
+    if not work:
+        log.info("Geocoder: nothing to do (%d KMZ-sourced, %d no-address).", skipped_kmz, no_address)
+        return
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    geocoded_high = 0
+    geocoded_medium = 0
+    geocoded_low = 0
+    failed = 0
+
+    def _one(idx: int, addr: str):
+        try:
+            result = geocoder.geocode(addr, api_key=api_key)
+            return (idx, addr, result, None)
+        except (geocoder.GeocodingError, geocoder.GeocoderUnavailable) as exc:
+            return (idx, addr, None, exc)
+
+    # Parallel fan-out. max_workers tracks address count up to a sane
+    # ceiling (don't unleash 200 threads on a giant KMZ).
+    n_workers = min(len(work), 12)
+    started_at = time.monotonic()
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futures = {pool.submit(_one, idx, addr): (idx, addr) for idx, addr in work}
+        for fut in as_completed(futures, timeout=PHASE_BUDGET_SEC):
+            try:
+                idx, addr, result, exc = fut.result()
+            except Exception as result_exc:
+                idx, addr = futures[fut]
+                exc = result_exc
+                result = None
+            if exc is not None:
+                log.warning("Geocode failed for %r: %s", addr, exc)
+                failed += 1
+                continue
+            if result is None:
+                log.info("No geocoding results for %r (all variants + Places fallback exhausted)", addr)
+                failed += 1
+                continue
+            request.locations[idx].estimate = LocationEstimate(
+                latitude=result.latitude,
+                longitude=result.longitude,
+                confidence=result.confidence,
+                source="geocoded",
+                notes=f"Google {result.location_type}: {result.formatted_address}",
+            )
+            if result.confidence == "high":
+                geocoded_high += 1
+            elif result.confidence == "medium":
+                geocoded_medium += 1
+            else:
+                geocoded_low += 1
+
+    elapsed = time.monotonic() - started_at
+    # Anything still in flight past PHASE_BUDGET_SEC fell off as_completed
+    # with a TimeoutError — count those as failed too. We don't try to
+    # interrupt running requests; they'll finish in the background and
+    # their result is discarded. The ThreadPoolExecutor.__exit__ would
+    # normally wait for them; we let it (max +REQUEST_TIMEOUT_SEC overhang).
+    completed_ok = geocoded_high + geocoded_medium + geocoded_low + failed
+    abandoned = len(work) - completed_ok
+    if abandoned > 0:
+        log.warning(
+            "Geocoder hit %ds phase budget; %d address(es) abandoned (kept LLM estimates).",
+            PHASE_BUDGET_SEC, abandoned,
+        )
+        failed += abandoned
+
+    log.info(
+        "Geocoder summary: %d high, %d medium, %d low confidence, %d skipped (KMZ), "
+        "%d no-address, %d failed; %d worker(s), %.1fs wall time.",
+        geocoded_high, geocoded_medium, geocoded_low,
+        skipped_kmz, no_address, failed, n_workers, elapsed,
+    )
 
 
 def _build_kmz_only_fallback(
