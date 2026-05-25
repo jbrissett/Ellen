@@ -1831,6 +1831,8 @@ def run_chat_turn(
                     # the user sees Ellen typing in real time via
                     # on_text_delta. The stream context manager returns the
                     # final Message via get_final_message() on exit.
+                    import time as _time
+                    _t_start = _time.monotonic()
                     with client.messages.stream(
                         model=model,
                         messages=history,
@@ -1841,6 +1843,20 @@ def run_chat_turn(
                             if delta:
                                 on_text_delta(delta)
                         response = stream.get_final_message()
+                    # Record usage to the global JSONL log (one record
+                    # per chat turn / tool round). Best-effort — never
+                    # break the chat flow on a record-write hiccup.
+                    try:
+                        from . import usage_tracker
+                        usage_tracker.record(
+                            phase="chat",
+                            model=model,
+                            usage_obj=getattr(response, "usage", None),
+                            duration_ms=int((_time.monotonic() - _t_start) * 1000),
+                            meta={"tool_round": _round, "attempt": attempt},
+                        )
+                    except Exception:
+                        pass
                     break  # success on this model — exit retry loop
                 except BaseException as exc:
                     last_exc = exc

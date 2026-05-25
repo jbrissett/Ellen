@@ -119,6 +119,8 @@ def _stream_with_retry(
                     )
 
             try:
+                import time
+                _t_start = time.monotonic()
                 with client.messages.stream(
                     model=model,
                     timeout=PER_REQUEST_TIMEOUT,
@@ -129,7 +131,22 @@ def _stream_with_retry(
                     # here (extraction is a tool call, not a text reply).
                     for _ in stream.text_stream:
                         pass
-                    return stream.get_final_message()
+                    msg = stream.get_final_message()
+                # Record usage to the global JSONL log so per-run cost can
+                # be reconstructed over time. Best-effort — never fail the
+                # extraction if the record write hiccups.
+                try:
+                    from . import usage_tracker
+                    usage_tracker.record(
+                        phase="extraction",
+                        model=model,
+                        usage_obj=getattr(msg, "usage", None),
+                        duration_ms=int((time.monotonic() - _t_start) * 1000),
+                        meta={"attempt": attempt, "fallback_model_idx": model_idx},
+                    )
+                except Exception:
+                    pass
+                return msg
             except BaseException as exc:
                 last_exc = exc
                 if not _retryable(exc):

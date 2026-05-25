@@ -5705,6 +5705,8 @@ def _llm_lookup_company_address(
         last_exc: Optional[BaseException] = None
         for attempt in range(1, 3):  # 2 tries total
             try:
+                import time as _time
+                _t_start = _time.monotonic()
                 response = client.messages.create(
                     model="claude-sonnet-4-6",
                     max_tokens=2000,
@@ -5714,6 +5716,25 @@ def _llm_lookup_company_address(
                     tools=[{"type": "web_search_20250305", "name": "web_search"}],
                     messages=[{"role": "user", "content": user_msg}],
                 )
+                # Record usage. Count web_search queries from the
+                # server_tool_use blocks in the response — each block
+                # corresponds to one billed query at $0.01.
+                try:
+                    n_queries = 0
+                    for blk in (response.content or []):
+                        if getattr(blk, "type", "") == "server_tool_use":
+                            n_queries += 1
+                    from . import usage_tracker
+                    usage_tracker.record(
+                        phase="company_address_search",
+                        model="claude-sonnet-4-6",
+                        usage_obj=getattr(response, "usage", None),
+                        duration_ms=int((_time.monotonic() - _t_start) * 1000),
+                        web_search_queries=n_queries,
+                        meta={"attempt": attempt},
+                    )
+                except Exception:
+                    pass
                 break  # success
             except (
                 _anthropic.APIConnectionError,
