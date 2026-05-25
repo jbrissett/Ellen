@@ -3401,6 +3401,12 @@ def _submit_request(page: Page, log: ProgressCallback) -> tuple[Optional[str], O
         log("Order submitted — confirming with OK.")
     except PlaywrightTimeoutError:
         log("(Didn't see the 'order submitted' confirmation within 15s)")
+        # Proactive DOM diagnostics — don't just bail with a vague timeout
+        # log. Read the actual page state so the run log says WHY (per
+        # feedback_proactive_dom_diagnostics.md). Observed run-20260525-101046:
+        # SUBMIT REQUEST click logged but the page stayed on /Admin/RequestAnEstimate
+        # with no visible error — root cause invisible without DOM inspection.
+        _log_submit_failure_diagnostics(page, log)
 
     if saw_confirmation:
         # Scope to the VISIBLE success modal — there are other Info Alert
@@ -3431,6 +3437,12 @@ def _submit_request(page: Page, log: ProgressCallback) -> tuple[Optional[str], O
         page.wait_for_url(re.compile(r"/Admin/Orders/\d+"), timeout=15_000)
     except PlaywrightTimeoutError:
         log(f"(No /Admin/Orders/... redirect detected. Current URL: {page.url})")
+        # If we ALSO didn't see the confirmation modal earlier, we already
+        # logged diagnostics — don't spam. But if we did see the confirmation
+        # and STILL didn't redirect, that's a fresh signal (server-side
+        # acceptance failed AFTER UI ack) and warrants its own readout.
+        if saw_confirmation:
+            _log_submit_failure_diagnostics(page, log)
 
     m = re.search(r"/Admin/Orders/(\d+)", page.url)
     order_id = m.group(1) if m else None
@@ -5150,6 +5162,160 @@ def _log_ng_invalid_inputs(modal, log: ProgressCallback, *, scope_label: str) ->
         if f.get("type") and f["tag"] == "input":
             desc += f" type={f['type']!r}"
         log(f"    - {desc}")
+
+
+def _log_submit_failure_diagnostics(page: Page, log: ProgressCallback) -> None:
+    """When SUBMIT REQUEST clicks but the confirmation modal never appears
+    (or the /Admin/Orders/{id} redirect never fires), read the actual page
+    state and log WHY — instead of leaving the user with a vague timeout.
+
+    Probes (each independent, all best-effort):
+      1. URL (so the log shows whether we navigated, half-navigated, or sat).
+      2. SUBMIT REQUEST button state — present? visible? enabled? If the
+         button is disabled, the click was a no-op and any earlier "Submitting
+         request…" log line is misleading.
+      3. Visible modals (`div.modal.fade.in`) — captures unexpected blocking
+         dialogs (Info Alert resurfaced, validation warning, session expired).
+      4. Visible toast/notification elements (Kendo / Bootstrap variants).
+      5. ng-invalid form controls at the page level (with their name +
+         placeholder + visible label, if findable).
+
+    Established 2026-05-25 after run-20260525-101046: the form filled cleanly
+    and SUBMIT REQUEST was clicked, but the page stayed on /Admin/RequestAnEstimate
+    with no surface error — root cause was invisible without manual page.html
+    spelunking. Per feedback_proactive_dom_diagnostics.md.
+    """
+    try:
+        log(f"  Submit-failure diagnostics — URL: {page.url}")
+    except Exception:
+        pass
+
+    # 2. SUBMIT REQUEST button state
+    try:
+        state = page.evaluate(
+            r"""() => {
+                // Match buttons by text 'SUBMIT REQUEST' (any case/whitespace)
+                const buttons = Array.from(document.querySelectorAll('button, input[type="button"], input[type="submit"]'));
+                const matches = buttons.filter(b => {
+                    const t = (b.innerText || b.value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                    return /^submit\s*request$/.test(t);
+                });
+                return matches.map(b => {
+                    const r = b.getBoundingClientRect();
+                    const cs = window.getComputedStyle(b);
+                    return {
+                        text: (b.innerText || b.value || '').trim(),
+                        disabled: b.disabled || b.hasAttribute('disabled'),
+                        ariaDisabled: b.getAttribute('aria-disabled') || null,
+                        visible: r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && cs.display !== 'none',
+                        classes: b.className || '',
+                    };
+                });
+            }"""
+        )
+        if not state:
+            log("  ⚠ No SUBMIT REQUEST button found in DOM — page may have navigated or button label changed.")
+        else:
+            for i, s in enumerate(state):
+                flag = "DISABLED" if s.get("disabled") or s.get("ariaDisabled") == "true" else "enabled"
+                vis = "visible" if s.get("visible") else "HIDDEN"
+                log(f"  SUBMIT REQUEST button[{i}]: {flag}, {vis}, classes={s.get('classes')!r}")
+    except Exception as exc:
+        log(f"  (couldn't probe SUBMIT REQUEST button state: {exc})")
+
+    # 3. Visible modals
+    try:
+        modals = page.evaluate(
+            r"""() => {
+                const out = [];
+                document.querySelectorAll('div.modal.fade.in, kendo-dialog').forEach(m => {
+                    const r = m.getBoundingClientRect();
+                    if (r.width === 0 || r.height === 0) return;
+                    const cs = window.getComputedStyle(m);
+                    if (cs.visibility === 'hidden' || cs.display === 'none') return;
+                    const text = (m.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+                    out.push({ tag: m.tagName.toLowerCase(), classes: m.className || '', text });
+                });
+                return out;
+            }"""
+        )
+        if modals:
+            log(f"  ⚠ {len(modals)} visible modal(s) on page:")
+            for m in modals:
+                log(f"    - {m['tag']} (classes={m['classes']!r}) text={m['text']!r}")
+        else:
+            log("  No visible modal blocking the page.")
+    except Exception as exc:
+        log(f"  (couldn't probe modal state: {exc})")
+
+    # 4. Toast / notification elements (Kendo k-notification, Bootstrap alert-*,
+    #    or any element whose class/role suggests a transient error message)
+    try:
+        toasts = page.evaluate(
+            r"""() => {
+                const sel = [
+                    '.k-notification',
+                    '.k-notification-content',
+                    '.toast',
+                    '[role="alert"]',
+                    '.alert-danger', '.alert-error', '.alert-warning',
+                    '.snack-bar', '.snackbar',
+                    '.notification', '.error-message', '.validation-message',
+                ].join(',');
+                const out = [];
+                document.querySelectorAll(sel).forEach(el => {
+                    const r = el.getBoundingClientRect();
+                    if (r.width === 0 || r.height === 0) return;
+                    const cs = window.getComputedStyle(el);
+                    if (cs.visibility === 'hidden' || cs.display === 'none' || parseFloat(cs.opacity) === 0) return;
+                    const text = (el.innerText || '').replace(/\s+/g, ' ').trim();
+                    if (!text) return;
+                    out.push({ tag: el.tagName.toLowerCase(), classes: el.className || '', text: text.slice(0, 200) });
+                });
+                return out;
+            }"""
+        )
+        if toasts:
+            log(f"  ⚠ {len(toasts)} visible toast/notification(s):")
+            for t in toasts:
+                log(f"    - {t['tag']} (classes={t['classes']!r}) text={t['text']!r}")
+        else:
+            log("  No visible toast/notification on page.")
+    except Exception as exc:
+        log(f"  (couldn't probe toast state: {exc})")
+
+    # 5. ng-invalid form controls at the page level
+    try:
+        invalid = page.evaluate(
+            r"""() => {
+                const out = [];
+                document.querySelectorAll('.ng-invalid').forEach(f => {
+                    if (!['INPUT', 'SELECT', 'TEXTAREA'].includes(f.tagName)) return;
+                    const r = f.getBoundingClientRect();
+                    if (r.width === 0 || r.height === 0) return;
+                    out.push({
+                        tag: f.tagName.toLowerCase(),
+                        name: f.getAttribute('name') || '(no name)',
+                        placeholder: f.getAttribute('placeholder') || '',
+                        type: f.getAttribute('type') || '',
+                    });
+                });
+                return out;
+            }"""
+        )
+        if invalid:
+            log(f"  ⚠ {len(invalid)} ng-invalid form control(s) on page:")
+            for f in invalid:
+                desc = f"{f['tag']}[name=\"{f['name']}\"]"
+                if f.get("placeholder"):
+                    desc += f" placeholder={f['placeholder']!r}"
+                if f.get("type") and f["tag"] == "input":
+                    desc += f" type={f['type']!r}"
+                log(f"    - {desc}")
+        else:
+            log("  No ng-invalid form controls on page — submit blocked for another reason.")
+    except Exception as exc:
+        log(f"  (couldn't probe ng-invalid state: {exc})")
 
 
 def _force_close_company_modal(modal, page: Page, log: ProgressCallback) -> None:
