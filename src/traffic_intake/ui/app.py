@@ -172,10 +172,11 @@ class MainWindow(QMainWindow):
         )
         self._floating_reply = widget
         widget.show_to_user()
-        # Also fire a tray toast so a user who's deep in another app
-        # gets the OS-level notification chime even if their attention
-        # isn't on the screen corner.
-        self.notify("Ellen has a question", _shorten(last_assistant_text, 120))
+        # NO redundant tray toast — the floating widget IS the
+        # notification per user direction 2026-05-24 ("i only need
+        # one.. the chat one"). Tray toasts are reserved for
+        # non-interactive job-completion events (map ready, order
+        # ready, errors).
 
     def _on_floating_reply_send(self, reply_text: str) -> None:
         """Floating reply widget callback — route the typed reply

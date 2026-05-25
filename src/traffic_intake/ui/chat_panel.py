@@ -46,6 +46,13 @@ class ChatPanel(QWidget):
         self.history.setOpenLinks(False)
         self.history.setOpenExternalLinks(False)
         self.history.anchorClicked.connect(self._on_anchor_clicked)
+        # Bump chat font to 12pt — Qt's default (~9pt on Windows) was
+        # too small for comfortable reading per user direction 2026-05-24.
+        # Applied to the whole panel so input + history + tool results
+        # all share the same readable size.
+        chat_font = self.font()
+        chat_font.setPointSize(12)
+        self.history.setFont(chat_font)
         layout.addWidget(self.history, 1)
 
         input_row = QHBoxLayout()
@@ -53,8 +60,10 @@ class ChatPanel(QWidget):
         self.input.setPlaceholderText(
             "Tell me what to change — e.g. 'make all TMC sites Large'…"
         )
+        self.input.setFont(chat_font)
         self.input.returnPressed.connect(self._on_send)
         self.btn_send = QPushButton("Send")
+        self.btn_send.setFont(chat_font)
         self.btn_send.clicked.connect(self._on_send)
         input_row.addWidget(self.input, 1)
         input_row.addWidget(self.btn_send)

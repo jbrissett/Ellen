@@ -146,7 +146,11 @@ class FloatingReplyWidget(QFrame):
         outer.addLayout(header_row)
 
         # --- Question text ---
-        q_label = QLabel(_truncate_for_display(question))
+        # Surface only the actual question(s) — Ellen's turn often
+        # opens with several lines of summary before getting to what
+        # she needs from the user. Caller passed the full assistant
+        # message; we extract just the '?' sentences for display.
+        q_label = QLabel(_extract_questions(question))
         q_label.setObjectName("Question")
         q_label.setWordWrap(True)
         outer.addWidget(q_label)
@@ -215,15 +219,65 @@ class FloatingReplyWidget(QFrame):
         self.move(QPoint(x, y))
 
 
-def _truncate_for_display(s: str, max_chars: int = 280) -> str:
-    """Shorten a long Ellen message to fit the popup. Preserves enough
-    text to be actionable; user can find the rest in the main chat.
+def _extract_questions(text: str, max_chars: int = 500) -> str:
+    """Pull just the question(s) out of Ellen's assistant message.
+
+    Why this exists (user direction 2026-05-24): Ellen often opens with
+    a summary paragraph or two before asking what she actually needs.
+    Showing the full message in the floating popup buried the questions
+    below the fold — user had to find the app window to see what was
+    being asked, defeating the popup's purpose.
+
+    Strategy:
+      1. Strip basic markdown (`**bold**`, `*italic*`, `` `code` ``)
+         since QLabel renders the raw asterisks otherwise.
+      2. Split on sentence boundaries (.!?) and pick sentences ending
+         in '?'.
+      3. If no '?' sentences, fall back to the LAST paragraph — that's
+         where Ellen's question tends to live when she phrases it as
+         a directive ("Confirm the dates work for you.") rather than
+         a literal question.
+
+    Returned text is plain-text (no markdown) and capped at max_chars
+    with an ellipsis if needed.
     """
-    s = (s or "").strip()
-    if len(s) <= max_chars:
-        return s
-    # Try to break at sentence boundary near the limit.
-    cut = s.rfind(". ", 0, max_chars)
-    if cut < max_chars // 2:
-        cut = max_chars
-    return s[:cut].rstrip(" .") + "…"
+    if not text:
+        return ""
+    cleaned = _strip_markdown(text)
+
+    # Sentence split. Lookbehind keeps the punctuation attached.
+    import re
+    sentences = re.split(r"(?<=[.!?])\s+", cleaned.strip())
+    questions = [s.strip() for s in sentences if s.strip().endswith("?")]
+    if questions:
+        joined = " ".join(questions)
+        if len(joined) <= max_chars:
+            return joined
+        return joined[: max_chars - 1].rstrip() + "…"
+
+    # No literal questions — use the last non-empty paragraph as a
+    # heuristic for "where she's getting at the ask."
+    paragraphs = [p.strip() for p in cleaned.split("\n\n") if p.strip()]
+    if paragraphs:
+        tail = paragraphs[-1]
+        if len(tail) <= max_chars:
+            return tail
+        return tail[: max_chars - 1].rstrip() + "…"
+    # Fallback: just the first max_chars of the message.
+    if len(cleaned) <= max_chars:
+        return cleaned
+    return cleaned[: max_chars - 1].rstrip() + "…"
+
+
+def _strip_markdown(s: str) -> str:
+    """Strip the markdown markers Ellen tends to emit (bold/italic
+    asterisks, single backticks). Plain-text result for QLabel display.
+    Order matters: bold (**) before italic (*) so we don't half-strip.
+    """
+    import re
+    out = s
+    out = re.sub(r"\*\*(.+?)\*\*", r"\1", out)  # **bold**
+    out = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"\1", out)  # *italic*
+    out = re.sub(r"`([^`]+)`", r"\1", out)       # `code`
+    out = re.sub(r"_([^_\n]+)_", r"\1", out)     # _italic_ (alt)
+    return out

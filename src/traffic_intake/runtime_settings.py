@@ -22,16 +22,17 @@ _ORG = "Quality Counts"
 _APP = "Traffic Intake"
 
 
-# Default for the headless toggle. False = browsers VISIBLE (dev /
-# diagnostics) — appropriate for the in-development build the user is
-# running today. The installer's post-install step will write
-# `headless_browsers=True` so the production install for QC staff opens
-# Ellen with browsers invisible out of the box.
+# Default for the headless toggle. TRUE = browsers run invisibly
+# (production / mass-deploy default per user direction 2026-05-24:
+# "the default setting should be invisible"). The project lead can
+# untick the Settings checkbox to surface the browsers for visual
+# diagnostics.
 #
-# Centralized here so flipping the default at installer-build time is
-# a one-line change to the install script (writes the registry value
-# under HKCU\Software\Quality Counts\Traffic Intake) — no Python rebuild.
-_DEFAULT_HEADLESS = False
+# Flipped from False → True 2026-05-24. Previous comment claimed the
+# installer would write this at install time; making it the code-level
+# default instead means a fresh install or a Settings-reset gets the
+# right behavior without depending on an installer post-step.
+_DEFAULT_HEADLESS = True
 
 
 def is_headless_mode() -> bool:

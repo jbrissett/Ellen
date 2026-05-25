@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QFont, QPainter, QPixmap
+from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QSplashScreen
 
 from .single_instance import (
@@ -46,6 +46,36 @@ QC_DUSK    = QColor(110, 110, 122)  # status-line gray
 # stays cheap to import (matters during bootstrap — we want to paint
 # before pulling in the rest of the app).
 _LOGO_PATH = Path(__file__).parent / "assets" / "qc_logo.png"
+
+# Application icon — used by Windows for the taskbar entry, alt-tab,
+# and the .lnk shortcut Inno Setup creates at install time. Built as a
+# multi-resolution QIcon so Windows picks the crispest size for the
+# context. All sizes generated programmatically and committed in
+# `assets/ellen_icon*.png` — see the icon-generation snippet in
+# commit history if you need to regenerate.
+_ICON_DIR = Path(__file__).parent / "assets"
+_ICON_PATHS = [
+    _ICON_DIR / "ellen_icon.png",       # 256 master
+    _ICON_DIR / "ellen_icon_128.png",
+    _ICON_DIR / "ellen_icon_64.png",
+    _ICON_DIR / "ellen_icon_48.png",
+    _ICON_DIR / "ellen_icon_32.png",
+    _ICON_DIR / "ellen_icon_16.png",
+]
+
+
+def _load_app_icon() -> QIcon:
+    """Return a multi-resolution QIcon for the Ellen app. Falls back to
+    an empty QIcon if the asset directory is missing (distribution
+    builds that dropped the assets — taskbar will use Qt's default).
+    """
+    icon = QIcon()
+    any_loaded = False
+    for p in _ICON_PATHS:
+        if p.exists():
+            icon.addFile(str(p))
+            any_loaded = True
+    return icon if any_loaded else QIcon()
 
 
 def _build_splash_pixmap() -> QPixmap:
@@ -158,6 +188,11 @@ def main() -> int:
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("Ellen")
     app.setOrganizationName("Quality Counts")
+    # Set the app-level window icon BEFORE the splash + main window
+    # are created so the taskbar entry, alt-tab thumbnail, and any
+    # popups inherit it. Same icon will be baked into the .lnk
+    # shortcut by Inno Setup at install time.
+    app.setWindowIcon(_load_app_icon())
 
     splash = QSplashScreen(
         _build_splash_pixmap(),
