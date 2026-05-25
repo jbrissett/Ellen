@@ -86,6 +86,27 @@ class SettingsDialog(QDialog):
         google_row_widget.setLayout(google_row)
         form.addRow("Google Geocoding API key:", google_row_widget)
 
+        self.here_key_input = QLineEdit()
+        self.here_key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        here_existing = config.get_here_api_key()
+        if here_existing:
+            self.here_key_input.setPlaceholderText(f"(saved: {here_existing[:12]}…) — paste a new key to overwrite")
+        else:
+            self.here_key_input.setPlaceholderText("HERE Geocoding & Search REST API key (~43 chars)")
+        here_show = QPushButton("Show")
+        here_show.setCheckable(True)
+        here_show.toggled.connect(
+            lambda checked: self.here_key_input.setEchoMode(
+                QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
+            )
+        )
+        here_row = QHBoxLayout()
+        here_row.addWidget(self.here_key_input, 1)
+        here_row.addWidget(here_show)
+        here_row_widget = QWidget()
+        here_row_widget.setLayout(here_row)
+        form.addRow("HERE API key:", here_row_widget)
+
         self.qchub_user_input = QLineEdit()
         self.qchub_pass_input = QLineEdit()
         self.qchub_pass_input.setEchoMode(QLineEdit.EchoMode.Password)
@@ -168,6 +189,24 @@ class SettingsDialog(QDialog):
                     return
             try:
                 config.set_google_geocoding_key(google)
+            except Exception as exc:
+                QMessageBox.critical(self, "Save failed", str(exc))
+                return
+
+        here = self.here_key_input.text().strip()
+        if here:
+            # HERE keys are typically ~43 chars alphanumeric + "-_"; flag
+            # obvious mistakes (too short / contains spaces) but don't be
+            # overly strict — HERE has rotated key formats over the years.
+            if len(here) < 20 or " " in here:
+                if QMessageBox.question(
+                    self, "Unexpected format",
+                    "That doesn't look like a HERE REST API key (expected ~43-char alphanumeric, "
+                    "no spaces). Save anyway?",
+                ) != QMessageBox.StandardButton.Yes:
+                    return
+            try:
+                config.set_here_api_key(here)
             except Exception as exc:
                 QMessageBox.critical(self, "Save failed", str(exc))
                 return
