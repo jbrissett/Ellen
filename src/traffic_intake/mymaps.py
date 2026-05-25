@@ -754,16 +754,65 @@ def _import_kmz(
     log(f"  (Import click took {time.perf_counter() - t_click_start:.1f}s.)")
     snap("after-import-click")
 
-    log("Waiting for upload picker iframe…")
-    t_iframe_start = time.perf_counter()
-    try:
-        page.wait_for_selector(PICKER_IFRAME_SELECTOR, timeout=15_000)
-    except PlaywrightTimeoutError:
-        raise MyMapsError("Import picker iframe did not appear after clicking Import.")
-    log(f"  (Picker iframe appeared in {time.perf_counter() - t_iframe_start:.1f}s.)")
-    snap("picker-iframe-visible")
+    # Picker handling, including a one-shot retry of the whole Import flow
+    # when Google's picker iframe loads its DOM shell but never renders
+    # its content (observed run-20260525-182211: iframe visible but empty
+    # white box, then degraded to a cloud-thinking placeholder — Browse
+    # button never appeared, we bailed after 16s of patient locator
+    # retries). The retry kills any open picker via Escape + re-clicks
+    # Import to ask Google for a fresh picker instance.
+    def _open_picker_and_wait_for_content() -> "FrameLocator":  # noqa: F821
+        log("Waiting for upload picker iframe…")
+        t_iframe_start = time.perf_counter()
+        try:
+            page.wait_for_selector(PICKER_IFRAME_SELECTOR, timeout=15_000)
+        except PlaywrightTimeoutError:
+            raise MyMapsError("Import picker iframe did not appear after clicking Import.")
+        log(f"  (Picker iframe appeared in {time.perf_counter() - t_iframe_start:.1f}s.)")
+        snap("picker-iframe-visible")
 
-    picker = page.frame_locator(PICKER_IFRAME_SELECTOR)
+        picker_inner = page.frame_locator(PICKER_IFRAME_SELECTOR)
+        # The iframe element being in the DOM is NOT the same as the
+        # picker's React app being loaded inside it. Wait for ANY
+        # clickable element to appear inside the iframe before declaring
+        # the picker ready. Without this, our Browse-button hunt would
+        # spin against an empty iframe and never recover.
+        t_content_start = time.perf_counter()
+        try:
+            picker_inner.locator("button, [role='button']").first.wait_for(
+                state="visible", timeout=20_000,
+            )
+        except PlaywrightTimeoutError:
+            raise MyMapsError(
+                "Picker iframe loaded but its content never rendered "
+                f"(no buttons after {time.perf_counter() - t_content_start:.0f}s)."
+            )
+        log(f"  (Picker content rendered in {time.perf_counter() - t_content_start:.1f}s.)")
+        snap("picker-content-rendered")
+        return picker_inner
+
+    try:
+        picker = _open_picker_and_wait_for_content()
+    except MyMapsError as exc:
+        log(f"  Picker did not load on first try ({exc}). Retrying once.")
+        # Dismiss whatever stalled picker is open + re-trigger Import.
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        page.wait_for_timeout(500)
+        try:
+            page.locator(f'[aria-label="{import_aria}"]:visible').last.click(timeout=4_000)
+        except Exception:
+            # Fall back to text-based — same chain as the initial click.
+            try:
+                page.get_by_text("Import", exact=True).last.click(timeout=4_000)
+            except Exception as click_exc:
+                raise MyMapsError(
+                    f"Picker stalled and the retry Import click also failed: {click_exc}"
+                )
+        snap("after-import-click-retry")
+        picker = _open_picker_and_wait_for_content()
 
     log("Uploading KMZ via Browse button (inside picker iframe)…")
     browse_patterns = [
