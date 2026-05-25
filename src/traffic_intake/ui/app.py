@@ -59,6 +59,16 @@ class MainWindow(QMainWindow):
         self._build_central()
         self.setStatusBar(QStatusBar())
 
+        # Accept drops anywhere on the window so the user can drop an
+        # email onto the toolbar, the chat panel, the gap between
+        # widgets, etc. — not just the narrow drop_zone widget. The
+        # dragEnter/drop methods below delegate to drop_zone's existing
+        # path-resolution + signal, so the rest of the app sees the same
+        # event flow as before. Per user feedback 2026-05-25: the whole
+        # left area should be the drop target, and the small drop_zone
+        # target was missing some drops outright.
+        self.setAcceptDrops(True)
+
         # System tray icon + interactive reply pop-up. Tray gives the
         # user a passive "Ellen is running" indicator in the taskbar
         # corner + handles `showMessage` toasts when background jobs
@@ -1001,6 +1011,41 @@ class MainWindow(QMainWindow):
                                 f"{exc}\n\nMake sure Outlook is open and you have an email selected.")
             return
         self.on_file_dropped(path)
+
+    # ----- window-wide drop forwarding -----
+    # The drop_zone widget knows how to resolve a drop (URL list, Outlook
+    # FileGroupDescriptor, etc.) and emits fileDropped on success. We
+    # accept drops at the window level too so any drop anywhere — toolbar
+    # gap, chat panel, status bar, you name it — reaches the same code
+    # path. Without this, drops outside the drop_zone's bounding rect
+    # were silently ignored, which the user reported as "drops aren't
+    # working all of a sudden" on 2026-05-25.
+
+    def dragEnterEvent(self, event):
+        # Delegate to the drop_zone's accept logic so the criteria stays
+        # in one place (file URLs OR Outlook FGD). drop_zone also flips
+        # its hover style for visual feedback.
+        self.drop_zone.dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        # Keep accepting throughout the drag; without this Qt re-checks
+        # acceptance on each move and can flip to "denied" cursor as the
+        # user moves across child widgets. Uses drop_zone's canonical
+        # FGD format list so the criteria stays in one place.
+        from .drop_zone import FGD_MIME_CANDIDATES
+        mime = event.mimeData()
+        if mime.hasUrls() or any(mime.hasFormat(f) for f in FGD_MIME_CANDIDATES):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self.drop_zone.dragLeaveEvent(event)
+
+    def dropEvent(self, event):
+        # Reuse drop_zone's resolve + emit so the rest of the app sees
+        # the same fileDropped signal it always has.
+        self.drop_zone.dropEvent(event)
 
     def on_file_dropped(self, path: Path) -> None:
         if not self._has_api_key():
