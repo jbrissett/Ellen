@@ -50,8 +50,12 @@ class DraftResult:
     subject: str
     attachment_path: Optional[str]
     map_url: Optional[str]
-    threaded_reply: bool  # True if Outlook's ReplyAll was used
+    threaded_reply: bool  # True if Outlook's ReplyAll was used (best path)
     note: str = ""
+    # How we landed on the draft — useful in the chat status message + diagnostics.
+    # Values: "openshareditem", "inbox-search", "manual-forwarded", "manual-fallback"
+    reply_path: str = ""
+    is_forwarded: bool = False
 
 
 # ---------- name + subject + body helpers ----------
@@ -181,10 +185,33 @@ def draft_reply(
 ) -> DraftResult:
     """Open an Outlook draft reply window with To/CC/Subject/Body/Attachment pre-filled.
 
-    Preferred path: open the source email in Outlook and call ReplyAll so
-    threading + all original parties are preserved exactly. Fallback:
-    create a fresh MailItem and manually populate To/CC from the source
-    email's parsed headers (or user-supplied overrides).
+    Goal (per user direction 2026-05-24): the draft should appear as a
+    Reply All to the CLIENT, with the original email thread inline below
+    our composed body and the estimate PDF attached. Behavior depends on
+    whether the source `.eml` was a fresh client message or a forwarded
+    one (QC staffer → data entry):
+
+      Non-forwarded:
+        Tier A — OpenSharedItem(.msg-or-.eml) + ReplyAll. Outlook
+                 handles threading, recipient inheritance, and the
+                 quoted body for free. `.msg` works reliably; `.eml`
+                 sometimes works, sometimes doesn't.
+        Tier B — Search the user's Inbox for the original message
+                 (by Subject + Sender), call ReplyAll on the found
+                 MailItem. Works when OpenSharedItem fails but the
+                 message is still in Outlook.
+        Tier C — Manual CreateItem with To=email_from,
+                 CC=email_to+email_cc minus QC, Subject="Re: ...",
+                 body=ours + manually-quoted original. Always works
+                 but no real threading headers.
+
+      Forwarded:
+        Always Tier C-manual, populated from the parser's
+        `original_*` fields (re-parsed here from the source .eml).
+        ReplyAll on a forwarded message would reply to the QC
+        forwarder, not the client — so we skip the Outlook paths
+        entirely and construct a synthetic reply targeted at
+        `original_from`.
 
     Returns immediately after the draft opens; the user reviews and sends
     themselves. Raises EmailDraftError if Outlook isn't available.
@@ -210,65 +237,117 @@ def draft_reply(
         has_pdf=pdf_path is not None,
     )
 
-    # Try the ReplyAll path first — preserves threading + all original
-    # parties at their original recipient levels (To becomes the original
-    # sender, CC becomes original recipients).
-    threaded = False
-    mail = None
+    # Re-parse the source .eml to extract forwarded-message metadata.
+    # StudyRequest doesn't currently carry `original_*` fields — the
+    # parser produces them on ParsedEmail but the extractor doesn't
+    # propagate them. One-time re-parse here is cheap and keeps the
+    # StudyRequest model unchanged.
+    is_forwarded = False
+    fwd_from: Optional[str] = None
+    fwd_to: Optional[str] = None
+    fwd_subject: Optional[str] = None
+    fwd_date: Optional[str] = None
+    fwd_body: str = ""
     source_path = artifacts.get("source_email_path")
     if source_path:
         source_p = Path(str(source_path))
         if source_p.exists():
             try:
-                original = outlook.Session.OpenSharedItem(str(source_p))
-                # MailItem class is 43. OpenSharedItem can return other
-                # types (appointments, contacts); reject those.
-                if getattr(original, "Class", None) == 43:
-                    mail = original.ReplyAll()
-                    threaded = True
+                from .parser import parse_email_file, prepare_for_extraction
+                parsed = parse_email_file(source_p)
+                prepare_for_extraction(parsed)
+                is_forwarded = bool(parsed.is_forwarded)
+                fwd_from = parsed.original_from
+                fwd_to = parsed.original_to
+                fwd_subject = parsed.original_subject
+                fwd_date = parsed.original_date
+                fwd_body = parsed.original_body or ""
             except Exception:
-                # .eml files often fail OpenSharedItem on Windows because
-                # Outlook prefers .msg; fall through to the manual path.
-                mail = None
+                # Re-parse failure isn't fatal; we treat as non-forwarded
+                # and proceed with email_* fields from the StudyRequest.
+                pass
 
-    # Fallback: build a fresh MailItem with manually-populated recipients.
-    if mail is None:
-        try:
-            mail = outlook.CreateItem(0)  # olMailItem
-        except Exception as exc:
-            raise EmailDraftError(f"Outlook.CreateItem failed: {exc}")
-        # To: original sender (or override). The StudyRequest carries the
-        # original From in `email_from`.
-        resolved_to = (to or _email_address_only(request.email_from) or "").strip()
-        if not resolved_to:
-            raise EmailDraftError(
-                "No To address — request has no email_from. Pass `to=` to override."
-            )
-        # CC: blend original To + original CC (minus QC's own address /
-        # the user's address), plus any explicit override.
-        cc_addrs = _build_cc(
-            original_to=request.email_to,
-            original_cc=request.email_cc,
-            our_address=_extract_outlook_user_address(outlook),
-            override=cc,
+    # ----- branch on forwarded -----
+    mail = None
+    threaded = False
+    reply_path = ""
+    our_address = _extract_outlook_user_address(outlook)
+
+    if is_forwarded:
+        # Manual construction targeting the ORIGINAL client, not the
+        # forwarder. ReplyAll on the forwarded message would land on the
+        # QC staffer who did the forwarding.
+        mail = _build_manual_reply(
+            outlook,
+            to_override=to,
+            cc_override=cc,
+            subject_override=subject,
+            target_from=fwd_from,
+            target_to_header=fwd_to,
+            target_cc_header=None,  # parser doesn't extract original_cc
+            target_subject=fwd_subject,
+            target_date=fwd_date,
+            target_body=fwd_body,
+            our_address=our_address,
+            body_html=body,
         )
-        mail.To = resolved_to
-        if cc_addrs:
-            mail.CC = "; ".join(cc_addrs)
-        mail.Subject = subject or _default_subject(request)
+        reply_path = "manual-forwarded"
 
-    # In either path: set body BEFORE the signature, preserve attachment.
+    else:
+        # Tier A: OpenSharedItem + ReplyAll (Outlook native).
+        if source_path:
+            source_p = Path(str(source_path))
+            if source_p.exists():
+                try:
+                    original = outlook.Session.OpenSharedItem(str(source_p))
+                    if getattr(original, "Class", None) == 43:  # olMail
+                        mail = original.ReplyAll()
+                        threaded = True
+                        reply_path = "openshareditem"
+                except Exception:
+                    mail = None  # fall through
+
+        # Tier B: search Inbox for the original message.
+        if mail is None:
+            found = _find_outlook_message_for_request(outlook, request)
+            if found is not None:
+                try:
+                    mail = found.ReplyAll()
+                    threaded = True
+                    reply_path = "inbox-search"
+                except Exception:
+                    mail = None  # fall through
+
+        # Tier C: manual fallback with quoted original.
+        if mail is None:
+            mail = _build_manual_reply(
+                outlook,
+                to_override=to,
+                cc_override=cc,
+                subject_override=subject,
+                target_from=request.email_from,
+                target_to_header=request.email_to,
+                target_cc_header=request.email_cc,
+                target_subject=request.email_subject,
+                target_date=request.email_date.isoformat() if request.email_date else None,
+                target_body=request.email_body or "",
+                our_address=our_address,
+                body_html=body,
+            )
+            reply_path = "manual-fallback"
+
+    # ----- fill body + attachment (common path) -----
+    # For Tier A / B (Outlook ReplyAll), HTMLBody already contains the
+    # quoted original — prepend ours.
+    # For Tier C (manual), _build_manual_reply already set HTMLBody to
+    # ours + quoted-original, so we just need to attach the PDF.
     try:
-        # Force signature insertion (only does anything in the CreateItem path).
-        _ = mail.GetInspector
-        existing = mail.HTMLBody or ""
-        # When ReplyAll: existing contains the quoted original. Prepend our
-        # body so it appears at the top with quote below.
-        mail.HTMLBody = body + existing
-
+        _ = mail.GetInspector  # forces signature insertion in CreateItem path
+        if reply_path in ("openshareditem", "inbox-search"):
+            existing = mail.HTMLBody or ""
+            mail.HTMLBody = body + existing
         if pdf_path is not None:
             mail.Attachments.Add(Source=str(pdf_path))
-
         mail.Display(False)  # modeless: window opens, code returns
     except Exception as exc:
         raise EmailDraftError(f"Filling Outlook draft failed: {exc}")
@@ -278,11 +357,18 @@ def draft_reply(
         note_bits.append("No estimate PDF was attached.")
     if not resolved_map:
         note_bits.append("No MyMaps share link was available — body uses the no-map variant.")
-    if not threaded:
+    if reply_path == "manual-fallback":
         note_bits.append(
-            "Couldn't open the source email in Outlook — recipients were "
-            "populated manually instead of via ReplyAll, so threading may "
-            "not be preserved."
+            "Couldn't find the original email in Outlook — built the reply "
+            "manually with the thread quoted inline. Threading headers "
+            "(In-Reply-To / References) are NOT set, so the client's "
+            "mail client may show it as a new thread."
+        )
+    if reply_path == "manual-forwarded":
+        note_bits.append(
+            "Source was a forwarded email — reply was constructed "
+            "manually so it targets the original client, not the QC "
+            f"forwarder. To: {getattr(mail, 'To', '') or '(empty)'}."
         )
 
     return DraftResult(
@@ -293,7 +379,183 @@ def draft_reply(
         map_url=resolved_map,
         threaded_reply=threaded,
         note=" ".join(note_bits),
+        reply_path=reply_path,
+        is_forwarded=is_forwarded,
     )
+
+
+# ---------- helpers for the new flow ----------
+
+def _build_manual_reply(
+    outlook,
+    *,
+    to_override: Optional[str],
+    cc_override: Optional[str],
+    subject_override: Optional[str],
+    target_from: Optional[str],
+    target_to_header: Optional[str],
+    target_cc_header: Optional[str],
+    target_subject: Optional[str],
+    target_date: Optional[str],
+    target_body: str,
+    our_address: Optional[str],
+    body_html: str,
+):
+    """CreateItem a fresh MailItem and populate it to LOOK like a Reply
+    All on `target_*` (the message we want to reply to — either the
+    StudyRequest's email_from / etc, or the parser's original_* fields
+    when the source was forwarded).
+
+    Sets:
+      - To: target_from (or override)
+      - CC: target_to_header + target_cc_header (minus the new To and
+            our own address) + override
+      - Subject: 'Re: <target_subject>' (or override)
+      - HTMLBody: body_html + manually-quoted target_body block
+    """
+    try:
+        mail = outlook.CreateItem(0)  # olMailItem
+    except Exception as exc:
+        raise EmailDraftError(f"Outlook.CreateItem failed: {exc}")
+
+    to_addr = (to_override or _email_address_only(target_from) or "").strip()
+    if not to_addr:
+        raise EmailDraftError(
+            "No To address — couldn't determine the original sender. "
+            "Pass `to=` to override."
+        )
+    cc_addrs = _build_cc(
+        original_to=target_to_header,
+        original_cc=target_cc_header,
+        our_address=our_address,
+        override=cc_override,
+    )
+    # Subject: prefix Re: if not already present.
+    if subject_override:
+        subj = subject_override
+    else:
+        raw_subj = (target_subject or "Traffic study estimate").strip()
+        subj = raw_subj if raw_subj.lower().startswith("re:") else f"Re: {raw_subj}"
+
+    mail.To = to_addr
+    if cc_addrs:
+        mail.CC = "; ".join(cc_addrs)
+    mail.Subject = subj
+
+    # Synthesize the quoted-original block so the draft looks like a real
+    # Reply All. Matches Outlook's own format closely enough that the
+    # reader's eye flows over it.
+    quoted = _build_quoted_original_html(
+        from_=target_from,
+        sent=target_date,
+        to=target_to_header,
+        cc=target_cc_header,
+        subject=target_subject,
+        body=target_body,
+    )
+    # Body composed; let GetInspector inject the user's signature, then
+    # set HTMLBody = our text + the user's signature + quoted original.
+    # (Signature lives in `mail.HTMLBody` after GetInspector touches it;
+    # we keep it between ours and the quote.)
+    _ = mail.GetInspector
+    existing = mail.HTMLBody or ""
+    mail.HTMLBody = body_html + existing + quoted
+    return mail
+
+
+def _build_quoted_original_html(
+    *,
+    from_: Optional[str],
+    sent: Optional[str],
+    to: Optional[str],
+    cc: Optional[str],
+    subject: Optional[str],
+    body: str,
+) -> str:
+    """Render an Outlook-style quoted-original block in HTML.
+
+    Format mirrors what Outlook injects on a real Reply:
+      <hr>
+      <p><b>From:</b> ...<br>
+         <b>Sent:</b> ...<br>
+         <b>To:</b> ...<br>
+         <b>Cc:</b> ... (omitted if empty)<br>
+         <b>Subject:</b> ...</p>
+      <p>... body, with newlines → <br> ...</p>
+    """
+    import html
+    def esc(s: Optional[str]) -> str:
+        return html.escape(s or "")
+    headers_bits = [f"<b>From:</b> {esc(from_)}"]
+    if sent:
+        headers_bits.append(f"<b>Sent:</b> {esc(sent)}")
+    if to:
+        headers_bits.append(f"<b>To:</b> {esc(to)}")
+    if cc:
+        headers_bits.append(f"<b>Cc:</b> {esc(cc)}")
+    if subject:
+        headers_bits.append(f"<b>Subject:</b> {esc(subject)}")
+    headers_html = "<br>".join(headers_bits)
+    body_html = esc(body).replace("\n", "<br>")
+    return (
+        '<hr style="border:none; border-top:1px solid #ccc; margin:18px 0;">'
+        f'<p style="font-family:Calibri,Arial,sans-serif; font-size:11pt;">'
+        f'{headers_html}</p>'
+        f'<div style="font-family:Calibri,Arial,sans-serif; font-size:11pt;">'
+        f'{body_html}</div>'
+    )
+
+
+def _find_outlook_message_for_request(outlook, request) -> Optional[object]:
+    """Search the user's default Inbox for an Outlook MailItem matching
+    the StudyRequest's subject + sender. Returns the MailItem or None.
+
+    Uses DASL `Restrict` on Subject (server-side indexed). Walks at most
+    the first 20 matches and picks one whose SenderEmailAddress contains
+    the parsed-out sender email (substring tolerance handles display-name
+    differences like 'Smith, John <jsmith@x.com>' vs the raw address).
+
+    This is the Tier-B fallback when OpenSharedItem(.eml) fails. Returns
+    None on any error (control flow continues to Tier C manual).
+    """
+    if not request.email_subject or not request.email_from:
+        return None
+    sender_email = _email_address_only(request.email_from) or ""
+    if not sender_email:
+        return None
+    try:
+        namespace = outlook.GetNamespace("MAPI")
+        inbox = namespace.GetDefaultFolder(6)  # olFolderInbox
+    except Exception:
+        return None
+    # DASL restriction on Subject. Escape single quotes by doubling.
+    safe_subj = request.email_subject.replace("'", "''")
+    flt = "@SQL=\"urn:schemas:httpmail:subject\" = '" + safe_subj + "'"
+    try:
+        results = inbox.Items.Restrict(flt)
+    except Exception:
+        return None
+    sender_lower = sender_email.lower()
+    try:
+        count = int(getattr(results, "Count", 0) or 0)
+    except Exception:
+        count = 0
+    if count == 0:
+        return None
+    # Walk results, return first matching sender. Cap iteration for safety.
+    for i in range(1, min(count, 20) + 1):
+        try:
+            item = results.Item(i)
+            if getattr(item, "Class", None) != 43:
+                continue
+            item_sender = (item.SenderEmailAddress or "").lower()
+            if not item_sender:
+                continue
+            if sender_lower in item_sender or item_sender in sender_lower:
+                return item
+        except Exception:
+            continue
+    return None
 
 
 # ---------- helpers used only on the fallback path ----------
