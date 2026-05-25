@@ -183,8 +183,46 @@ def _open_path_if_email(arg: str, window) -> bool:
     return True
 
 
+def _claim_distinct_taskbar_identity() -> None:
+    """Tell Windows we're a distinct app (not just `python.exe`) so the
+    taskbar shows OUR window icon instead of the Python launcher's
+    icon, and so our window doesn't get grouped with other Python apps.
+
+    Windows uses the AppUserModelID (AUMID) to identify a "distinct"
+    application for taskbar pinning, jump-lists, and icon resolution.
+    When a Python script runs via python.exe, Windows defaults to the
+    interpreter's AUMID — so every Python app shares the python.exe
+    icon and groups together in the taskbar.
+
+    `SetCurrentProcessExplicitAppUserModelID` overrides that for THIS
+    process. Must be called BEFORE the first window is created.
+
+    No-op on non-Windows, and swallows errors silently so a missing
+    shell32 export (very old Win or unusual environment) doesn't
+    block startup. Once we ship as a PyInstaller .exe this becomes
+    redundant — the .exe has its own AUMID + embedded icon — but
+    it's harmless to leave in.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        # Reverse-DNS-style ID. Format is arbitrary but must be unique
+        # to this app; matches the org / app naming we use elsewhere.
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "QualityCounts.Ellen.WorkplaceAssistant.1"
+        )
+    except Exception:
+        pass
+
+
 def main() -> int:
-    # 1. QApplication + splash (no heavy imports yet).
+    # 1. Claim a distinct Windows AppUserModelID BEFORE QApplication
+    # constructs (and thus before any window appears) so the taskbar
+    # uses our app icon instead of python.exe's.
+    _claim_distinct_taskbar_identity()
+
+    # 2. QApplication + splash (no heavy imports yet).
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName("Ellen")
     app.setOrganizationName("Quality Counts")
@@ -201,7 +239,7 @@ def main() -> int:
     splash.show()
     _set_status(splash, "Loading…")
 
-    # 2. Single-instance enforcement.
+    # 3. Single-instance enforcement.
     key = instance_key()
     server = claim_single_instance(key)
     if server is None:
@@ -213,14 +251,14 @@ def main() -> int:
         splash.close()
         return 0
 
-    # 3. Heavy imports — splash stays visible.
+    # 4. Heavy imports — splash stays visible.
     _set_status(splash, "Loading core modules…")
     from .app import MainWindow
 
     _set_status(splash, "Building main window…")
     window = MainWindow()
 
-    # 4. Wire single-instance handoff: a future second-launch attempt
+    # 5. Wire single-instance handoff: a future second-launch attempt
     # raises THIS window and processes any .eml argument it sent.
     def _on_secondary_launch(args: list[str]) -> None:
         # Raise + activate the existing window.
@@ -241,7 +279,7 @@ def main() -> int:
 
     handler = install_secondary_launch_handler(server, _on_secondary_launch)  # noqa: F841 (kept alive by ref)
 
-    # 5. If we were launched WITH an email path, process it now.
+    # 6. If we were launched WITH an email path, process it now.
     initial_args = [a for a in sys.argv[1:] if a]
     for a in initial_args:
         if _open_path_if_email(a, window):
