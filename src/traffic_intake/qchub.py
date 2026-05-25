@@ -2566,17 +2566,47 @@ def _drive_one_group(
 def _tube_duration_and_unit(window) -> tuple[int, str]:
     """Convert a TimeWindow to qchub's Tube form (Duration, Unit) pair.
 
+    Per user direction 2026-05-25: tube counts in qchub are billed
+    + scheduled in Days, not Hours. Default unit is "Days"; we only
+    fall back to "Hours" for the rare sub-day count (e.g., a 4-hour
+    morning sample). A 24-hour window (single full day) goes in as
+    "1 Day" — not "24 Hours" — even though both render equivalently
+    in qchub's UI.
+
+    NOTE on unit values: qchub's <select> uses singular VALUES
+    ("Day", "Hour") even though the visible display text is plural
+    ("Days", "Hours"). We return the singular form because the form
+    fill code calls `select_option(value=...)`. Don't change to plural
+    without also changing the select call.
+
     Priority:
-      1. If `total_hours` is set on the window (multi-day counts like 72h),
-         use it. Pick "Day" if divisible by 24, else "Hour".
-      2. Otherwise compute hours from start-end (single-day window).
+      1. If `total_hours` is set on the window (multi-day counts), prefer
+         Day when the duration is a whole number of days (≥24h AND
+         divisible by 24). Sub-day or weird-duration counts go in as
+         Hour. Examples:
+           total_hours=168 → (7, "Day")    # 7-day count
+           total_hours=72  → (3, "Day")    # 72-hour classification
+           total_hours=24  → (1, "Day")    # single full day
+           total_hours=8   → (8, "Hour")   # 8-hour sample
+           total_hours=36  → (36, "Hour")  # weird duration; not whole days
+      2. If total_hours is missing, compute span from start–end. A
+         single-day full-day window (00:00–23:59) counts as 1 Day;
+         anything else falls back to Hours.
     """
     if window.total_hours and window.total_hours > 0:
         h = int(window.total_hours)
         if h >= 24 and h % 24 == 0:
             return h // 24, "Day"
         return h, "Hour"
+
+    # Fallback path — total_hours not set. The extractor SHOULD set it
+    # for multi-day counts (extractor schema now requires it); this
+    # branch catches single-day windows + extractor misses.
     h = _hours_between(window.start, window.end)
+    # 24-hour window == 1 full day. Express in Day so the qchub
+    # form value matches how operations thinks about it.
+    if h == 24:
+        return 1, "Day"
     return h, "Hour"
 
 

@@ -201,6 +201,20 @@ _LOCATION_PROPS = {
                 "label": {"type": "string"},
                 "start": {"type": "string", "description": "24h HH:MM"},
                 "end": {"type": "string", "description": "24h HH:MM"},
+                "total_hours": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": (
+                        "REQUIRED whenever the count runs longer than one "
+                        "calendar day. Examples: 72-hour count → 72; "
+                        "7-day, 24-hour count → 168; 1-week → 168; "
+                        "2-week → 336. OMIT for single-day windows "
+                        "(AM/PM peaks, single 24-hour day) — start/end "
+                        "alone are enough there. The qchub Tube form "
+                        "uses this to compute Duration + unit "
+                        "(72 → 3 Days; 168 → 7 Days; 24 → 1 Day)."
+                    ),
+                },
                 "raw_text": {"type": "string"},
                 "flag": {
                     "type": "string",
@@ -290,7 +304,30 @@ RULES:
     * 'speed' mentioned → volume_speed
     * 'class', 'classification', 'classification count', '13-bin', or 'fhwa' mentioned → volume_class
     * both speed AND classification → volume_speed_class
-    * "72-hour classification count" / "72-hr class count" → volume_class (the duration goes in time_windows.total_hours, the 'classification' word is the subtype cue)
+    * "72-hour classification count" / "72-hr class count" → volume_class (the 'classification' word is the subtype cue; duration is a SEPARATE field — see below)
+- **Tube DURATION — `time_windows[].total_hours` (REQUIRED for any count longer than one calendar day)**:
+    * Always set `total_hours` whenever the email describes a count
+      that runs longer than one calendar day, OR describes a count
+      explicitly in N-day / N-week language even if the value is a
+      multiple of 24h. Conversion table:
+        - "24-hour" / "24-hr" → total_hours=24 (single day; technically optional but pass it)
+        - "48-hour" / "48-hr" → total_hours=48
+        - "72-hour" / "72-hr" / "3-day" → total_hours=72
+        - "7-day" / "1-week" / "weeklong" / "7-Day 24-Hour" → total_hours=168
+        - "14-day" / "2-week" → total_hours=336
+        - "30-day" / "1-month" → total_hours=720
+    * If the label says BOTH a day-count AND "24-hour" (e.g.
+      "7-Day, 24-Hour with Class"), use the DAY count for total_hours.
+      The "24-hour" part means "operated 24 hours per day" — the
+      total length is the day count × 24. So "7-Day, 24-Hour" →
+      total_hours=168, NOT 24.
+    * Single-day peak-period windows (AM peak, PM peak, school-out)
+      that are SHORTER than 24 hours: leave total_hours OFF; start/end
+      alone are enough.
+    * The qchub Tube form bills + schedules in Days, so getting
+      total_hours right is critical — under-stating it (e.g., 24
+      instead of 168 for a 7-day count) produces an order that quotes
+      1/7th the work.
 - If a time window is contradictory (e.g. 'a.m. peak period (7:00 p.m. to 9:00 p.m.)'), populate start/end with your best interpretation AND fill the `flag` field with the contradiction. Never silently rewrite.
 - address_or_intersection: use 'and' not '&'; include city + state.
 

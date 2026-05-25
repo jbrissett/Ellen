@@ -1082,6 +1082,42 @@ def _summarize_kmz_attachment(att) -> str:
     return "\n".join(lines)
 
 
+def _scrub_dollars_from_estimate_result(result):
+    """Replace dollar amounts in an estimate-tool result with sentinels
+    so Ellen literally cannot read (and therefore cannot misquote) them.
+
+    Why this exists (user direction 2026-05-25): Ellen kept quoting
+    dollar totals in chat despite the system-prompt rule forbidding
+    it. The values arrived in tool results — get_estimate_lines and
+    re_capture_estimate both included `unit_price`, `line_total`,
+    `quantity`, `total` — and the model couldn't help itself when
+    asked "did the rates apply?" Replacing those fields with
+    "<see PDF>" makes it impossible for Ellen to be wrong about the
+    number; she has to point the user at the PDF.
+
+    Preserves fields Ellen NEEDS for orchestration: description,
+    raw_text, line_index, pdf_path, version — everything useful for
+    matching rows + reporting which version of the PDF is current.
+
+    Works on dicts, lists of dicts, and nested structures. No-op on
+    primitives + on dicts that don't contain any of the scrubbed keys.
+    """
+    _SCRUB_KEYS = {"unit_price", "line_total", "quantity", "total", "extra_rate"}
+    _SENTINEL = "<see PDF>"
+
+    if isinstance(result, dict):
+        out = {}
+        for k, v in result.items():
+            if k in _SCRUB_KEYS:
+                out[k] = _SENTINEL
+            else:
+                out[k] = _scrub_dollars_from_estimate_result(v)
+        return out
+    if isinstance(result, list):
+        return [_scrub_dollars_from_estimate_result(item) for item in result]
+    return result
+
+
 def execute_tool(
     name: str,
     args: dict,
@@ -1153,32 +1189,38 @@ def execute_tool(
                     "timeout). Re-create the order to start a new editable session."
                 )
             try:
+                # All return paths funnel through `_scrub_dollars_from_estimate_result`
+                # so Ellen NEVER sees the raw dollar amounts (unit_price /
+                # line_total / quantity / total / extra_rate). The PDF is
+                # the only source of truth she should reference for money.
+                # See the helper's docstring for the rationale.
                 if name == "get_estimate_lines":
                     lines = qchub_edit_session.get_lines()
-                    return json.dumps({"order_id": qchub_edit_session.order_id, "lines": lines}, indent=2)
+                    payload = {"order_id": qchub_edit_session.order_id, "lines": lines}
+                    return json.dumps(_scrub_dollars_from_estimate_result(payload), indent=2)
                 if name == "list_estimate_subtype_options":
                     result = qchub_edit_session.list_subtype_options(int(args["line_index"]))
-                    return json.dumps(result, indent=2)
+                    return json.dumps(_scrub_dollars_from_estimate_result(result), indent=2)
                 if name == "set_estimate_subtype":
                     result = qchub_edit_session.set_subtype(int(args["line_index"]), str(args["subtype"]))
-                    return json.dumps(result, indent=2)
+                    return json.dumps(_scrub_dollars_from_estimate_result(result), indent=2)
                 if name == "set_estimate_rate":
                     result = qchub_edit_session.set_rate(
                         int(args["line_index"]),
                         float(args["unit_price"]),
                         extra_rate=float(args.get("extra_rate", 0.0)),
                     )
-                    return json.dumps(result, indent=2)
+                    return json.dumps(_scrub_dollars_from_estimate_result(result), indent=2)
                 if name == "apply_estimate_rate_to_all_matching":
                     result = qchub_edit_session.apply_rate_to_all_matching(
                         str(args["subtype_contains"]),
                         float(args["unit_price"]),
                         extra_rate=float(args.get("extra_rate", 0.0)),
                     )
-                    return json.dumps(result, indent=2)
+                    return json.dumps(_scrub_dollars_from_estimate_result(result), indent=2)
                 if name == "re_capture_estimate":
                     result = qchub_edit_session.re_capture()
-                    return json.dumps(result, indent=2)
+                    return json.dumps(_scrub_dollars_from_estimate_result(result), indent=2)
             except Exception as exc:
                 return f"Error from qchub edit session ({name}): {type(exc).__name__}: {exc}"
 
