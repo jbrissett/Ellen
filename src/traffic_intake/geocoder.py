@@ -899,18 +899,25 @@ def _intersection_chain(
 
     Returns first hit. None if every tier missed → caller falls to LLM text estimate.
     """
+    from . import trace_log  # local import — avoid module-load circularity
+
     street_a, street_b = parsed["street_a"], parsed["street_b"]
     city, state = parsed["city"], parsed["state"]
+    addr_tag = f"{street_a} & {street_b}, {city}, {state}"
 
     # Resolve the city bbox once up-front. Cached after the first lookup
     # per process, so emails with multiple intersections in the same city
     # only pay this Geocoding call once.
-    bbox = _locality_bbox(city, state, api_key)
+    with trace_log.timed("geocoder.bbox_lookup", city=city, state=state) as t:
+        bbox = _locality_bbox(city, state, api_key)
+        t["bbox_resolved"] = bbox is not None
     is_interchange = _is_interchange_shaped(parsed)
 
     # ---- Tier 1: Overpass intersection-node (skipped for interchanges) ----
     if not is_interchange:
-        result = _overpass_intersection(street_a, street_b, city, state, bbox=bbox)
+        with trace_log.timed("geocoder.tier", phase="overpass_raw", address=addr_tag) as t:
+            result = _overpass_intersection(street_a, street_b, city, state, bbox=bbox)
+            t["hit"] = result is not None
         if result is not None:
             log.info("Tier 1 (Overpass raw) HIT %r × %r in %s — exact node.",
                      street_a, street_b, city)
@@ -918,7 +925,9 @@ def _intersection_chain(
 
     # ---- Tier 1b: Overpass motorway_junction (interchanges only) ----
     if is_interchange:
-        result = _overpass_motorway_junction(street_a, street_b, city, state, bbox=bbox)
+        with trace_log.timed("geocoder.tier", phase="overpass_motorway_junction", address=addr_tag) as t:
+            result = _overpass_motorway_junction(street_a, street_b, city, state, bbox=bbox)
+            t["hit"] = result is not None
         if result is not None:
             log.info("Tier 1b (Overpass motorway_junction) HIT %r × %r in %s — exact ramp node.",
                      street_a, street_b, city)
@@ -929,16 +938,20 @@ def _intersection_chain(
     canonicalized = False
     canon_a, canon_b = street_a, street_b
     if not is_interchange:
-        canon_a = _places_new_autocomplete_route(street_a, bbox, api_key) or street_a
-        canon_b = _places_new_autocomplete_route(street_b, bbox, api_key) or street_b
-        canonicalized = (canon_a, canon_b) != (street_a, street_b)
+        with trace_log.timed("geocoder.tier", phase="autocomplete", address=addr_tag) as t:
+            canon_a = _places_new_autocomplete_route(street_a, bbox, api_key) or street_a
+            canon_b = _places_new_autocomplete_route(street_b, bbox, api_key) or street_b
+            canonicalized = (canon_a, canon_b) != (street_a, street_b)
+            t["canonicalized"] = canonicalized
         if canonicalized:
             log.info("Autocomplete canonicalized: %r → %r ; %r → %r",
                      street_a, canon_a, street_b, canon_b)
 
     # ---- Tier 3: Overpass with canonical names ----
     if canonicalized:
-        result = _overpass_intersection(canon_a, canon_b, city, state, bbox=bbox)
+        with trace_log.timed("geocoder.tier", phase="overpass_canonical", address=addr_tag) as t:
+            result = _overpass_intersection(canon_a, canon_b, city, state, bbox=bbox)
+            t["hit"] = result is not None
         if result is not None:
             log.info("Tier 3 (Overpass canonical) HIT %r × %r in %s — exact node.",
                      canon_a, canon_b, city)
@@ -949,7 +962,11 @@ def _intersection_chain(
     # tagged-tier coords (intersection / street / houseNumber); confidence
     # mapping in GeocodeResult.confidence handles the gradient.
     here_query = f"{canon_a} and {canon_b}, {city}, {state}"
-    result = _here_geocode(here_query, city=city, state=state)
+    with trace_log.timed("geocoder.tier", phase="here", address=addr_tag) as t:
+        result = _here_geocode(here_query, city=city, state=state)
+        t["hit"] = result is not None
+        if result is not None:
+            t["result_type"] = result.location_type
     if result is not None:
         log.info("Tier 4 (HERE) HIT for %r in %s — resultType=%s",
                  here_query, city, result.location_type)
@@ -964,14 +981,34 @@ def _intersection_chain(
 
 
 def geocode(address: str, *, api_key: Optional[str] = None) -> Optional[GeocodeResult]:
-    """Resolve `address` to lat/lon using the most-accurate-first chain.
+    """Thin wrapper around `_geocode_impl` that emits a per-address
+    `geocoder.address_total` trace event with total wall time + final
+    source tier (or `miss` if all tiers failed). Combined with the
+    per-tier events from `_intersection_chain`, this gives a complete
+    breakdown for every address.
+    """
+    from . import trace_log
+    with trace_log.timed("geocoder.address_total", address=address) as t:
+        try:
+            result = _geocode_impl(address, api_key=api_key)
+        except Exception as exc:
+            t["error"] = f"{type(exc).__name__}: {exc}"
+            raise
+        if result is None:
+            t["outcome"] = "miss"
+        else:
+            t["outcome"] = "hit"
+            t["source"] = result.location_type
+            t["confidence"] = result.confidence
+        return result
 
-    Dispatch:
+
+def _geocode_impl(address: str, *, api_key: Optional[str] = None) -> Optional[GeocodeResult]:
+    """Internal implementation. Dispatch:
       - If the address parses as "<X> and <Y>, <city>, <state>" → run the
-        INTERSECTION chain: Overpass (OSM) → Places (New) searchText →
-        Autocomplete-canonicalize + retry. Each tier hits a strictly more
-        permissive / more expensive matcher than the previous; first
-        success wins.
+        INTERSECTION chain: Overpass (OSM) → Autocomplete → Overpass-canonical
+        → HERE. Each tier hits a strictly more permissive / more expensive
+        matcher than the previous; first success wins.
       - On miss from the intersection chain (or for non-intersection
         addresses like single street numbers), fall back to the LEGACY
         chain: Geocoding API variants → Places Find Place → APPROXIMATE

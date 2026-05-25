@@ -588,6 +588,9 @@ def _refine_estimates_via_geocoding(request: StudyRequest) -> None:
         log.info("Geocoder: nothing to do (%d KMZ-sourced, %d no-address).", skipped_kmz, no_address)
         return
 
+    # Phase-level trace event so we can see total geocoder wall time +
+    # the address-count split, without having to aggregate per-tier events.
+    from . import trace_log
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     geocoded_high = 0
@@ -615,59 +618,83 @@ def _refine_estimates_via_geocoding(request: StudyRequest) -> None:
     # flight addresses as abandoned (they keep their LLM estimates).
     # Established 2026-05-25 after the user saw this exact failure mode on
     # an 8-intersection email post-chain-rewrite.
-    from concurrent.futures import TimeoutError as FutTimeoutError
+    from concurrent.futures import TimeoutError as FutTimeoutError, wait
+
+    # Counter helpers, used both by the main loop and the drain phase below.
+    processed: set = set()
+    def _apply_one(fut):
+        """Apply a completed future's result to request.locations + counters."""
+        nonlocal geocoded_high, geocoded_medium, geocoded_low, failed
+        if fut in processed:
+            return
+        processed.add(fut)
+        try:
+            idx, addr, result, exc = fut.result()
+        except Exception as result_exc:
+            idx, addr = futures[fut]
+            exc = result_exc
+            result = None
+        if exc is not None:
+            log.warning("Geocode failed for %r: %s", addr, exc)
+            failed += 1
+            return
+        if result is None:
+            log.info("No geocoding results for %r (all variants + Places fallback exhausted)", addr)
+            failed += 1
+            return
+        request.locations[idx].estimate = LocationEstimate(
+            latitude=result.latitude,
+            longitude=result.longitude,
+            confidence=result.confidence,
+            source="geocoded",
+            notes=f"Google {result.location_type}: {result.formatted_address}",
+        )
+        if result.confidence == "high":
+            geocoded_high += 1
+        elif result.confidence == "medium":
+            geocoded_medium += 1
+        else:
+            geocoded_low += 1
+
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
         futures = {pool.submit(_one, idx, addr): (idx, addr) for idx, addr in work}
         try:
             for fut in as_completed(futures, timeout=PHASE_BUDGET_SEC):
-                try:
-                    idx, addr, result, exc = fut.result()
-                except Exception as result_exc:
-                    idx, addr = futures[fut]
-                    exc = result_exc
-                    result = None
-                if exc is not None:
-                    log.warning("Geocode failed for %r: %s", addr, exc)
-                    failed += 1
-                    continue
-                if result is None:
-                    log.info("No geocoding results for %r (all variants + Places fallback exhausted)", addr)
-                    failed += 1
-                    continue
-                request.locations[idx].estimate = LocationEstimate(
-                    latitude=result.latitude,
-                    longitude=result.longitude,
-                    confidence=result.confidence,
-                    source="geocoded",
-                    notes=f"Google {result.location_type}: {result.formatted_address}",
-                )
-                if result.confidence == "high":
-                    geocoded_high += 1
-                elif result.confidence == "medium":
-                    geocoded_medium += 1
-                else:
-                    geocoded_low += 1
+                _apply_one(fut)
         except FutTimeoutError:
-            # Phase budget exceeded — proceed with whatever completed.
-            # The abandoned-count logic below logs the partial state.
+            # Phase budget hit. DRAIN: give in-flight workers a tight
+            # extra window to finish + apply their results so we don't
+            # lose data that arrived a moment too late. Without this
+            # drain, workers that completed AFTER the budget but BEFORE
+            # the pool's shutdown got their results discarded — those
+            # addresses fell to LLM text estimates despite the chain
+            # having successfully resolved them. Observed run-20260525-162802
+            # (Pittsboro on coverage-here-tier): 5/16 addresses fell to
+            # text_only despite HERE having the data, due to this race.
+            DRAIN_BUDGET = REQUEST_TIMEOUT_SEC + 5  # max single-call timeout + buffer
+            remaining = [f for f in futures if f not in processed]
             log.warning(
-                "Geocoder phase exceeded %ds budget — proceeding with partial results "
-                "(still-in-flight addresses keep their LLM-estimated coords).",
-                PHASE_BUDGET_SEC,
+                "Geocoder phase hit %ds budget — draining %d in-flight worker(s) "
+                "for up to %ds more so late results aren't lost.",
+                PHASE_BUDGET_SEC, len(remaining), DRAIN_BUDGET,
             )
+            done, not_done = wait(remaining, timeout=DRAIN_BUDGET)
+            for fut in done:
+                _apply_one(fut)
+            if not_done:
+                log.warning(
+                    "Drain timed out with %d worker(s) still running — those "
+                    "addresses kept their LLM-estimated coords.", len(not_done),
+                )
 
     elapsed = time.monotonic() - started_at
-    # Anything still in flight past PHASE_BUDGET_SEC fell off as_completed
-    # with a TimeoutError — count those as failed too. We don't try to
-    # interrupt running requests; they'll finish in the background and
-    # their result is discarded. The ThreadPoolExecutor.__exit__ would
-    # normally wait for them; we let it (max +REQUEST_TIMEOUT_SEC overhang).
+    # Anything still unprocessed after the drain is genuinely abandoned.
     completed_ok = geocoded_high + geocoded_medium + geocoded_low + failed
     abandoned = len(work) - completed_ok
     if abandoned > 0:
         log.warning(
-            "Geocoder hit %ds phase budget; %d address(es) abandoned (kept LLM estimates).",
-            PHASE_BUDGET_SEC, abandoned,
+            "Geocoder: %d address(es) abandoned post-drain (kept LLM estimates).",
+            abandoned,
         )
         failed += abandoned
 
@@ -676,6 +703,14 @@ def _refine_estimates_via_geocoding(request: StudyRequest) -> None:
         "%d no-address, %d failed; %d worker(s), %.1fs wall time.",
         geocoded_high, geocoded_medium, geocoded_low,
         skipped_kmz, no_address, failed, n_workers, elapsed,
+    )
+    trace_log.event(
+        "geocoder.phase_summary",
+        duration_ms=int(elapsed * 1000),
+        n_addresses=len(work),
+        high=geocoded_high, medium=geocoded_medium, low=geocoded_low,
+        failed=failed, abandoned=abandoned, n_workers=n_workers,
+        budget_sec=PHASE_BUDGET_SEC,
     )
 
 

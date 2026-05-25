@@ -458,6 +458,15 @@ class MainWindow(QMainWindow):
     # ----- chat -----
 
     def on_chat_send(self, message: str) -> None:
+        # Trace event: marks the moment the user clicked Send. The next
+        # `ui.worker_started` event tells us how long Qt event loop + UI
+        # validation took; `chat.first_api_call_end` (from usage_tracker)
+        # tells us how long the API call itself took including TLS / cold
+        # start. Together they quantify the "ghost gap" between user
+        # send and Ellen's first visible response token.
+        from .. import trace_log
+        trace_log.event("ui.send_clicked", msg_len=len(message or ""))
+
         request = self.extraction_panel.request()
         if request is None:
             self.chat_panel.appendSystemNote(
@@ -471,6 +480,7 @@ class MainWindow(QMainWindow):
             return
 
         self.chat_panel.setBusy(True)
+        trace_log.event("ui.worker_started", phase="chat")
         run_chat(
             message,
             self._chat_history,

@@ -1841,7 +1841,9 @@ def run_chat_turn(
                     # on_text_delta. The stream context manager returns the
                     # final Message via get_final_message() on exit.
                     import time as _time
+                    from . import trace_log
                     _t_start = _time.monotonic()
+                    _first_token_recorded = False
                     with client.messages.stream(
                         model=model,
                         messages=history,
@@ -1850,8 +1852,24 @@ def run_chat_turn(
                     ) as stream:
                         for delta in stream.text_stream:
                             if delta:
+                                # Trace first-token-in latency — quantifies the gap
+                                # between API call start and Anthropic actually
+                                # streaming, separate from total stream wall time.
+                                if not _first_token_recorded:
+                                    trace_log.event(
+                                        "chat.first_token",
+                                        duration_ms=int((_time.monotonic() - _t_start) * 1000),
+                                        model=model, tool_round=_round, attempt=attempt,
+                                    )
+                                    _first_token_recorded = True
                                 on_text_delta(delta)
                         response = stream.get_final_message()
+                    trace_log.event(
+                        "chat.stream_finalized",
+                        duration_ms=int((_time.monotonic() - _t_start) * 1000),
+                        model=model, tool_round=_round, attempt=attempt,
+                        first_token_recorded=_first_token_recorded,
+                    )
                     # Record usage to the global JSONL log (one record
                     # per chat turn / tool round). Best-effort — never
                     # break the chat flow on a record-write hiccup.
