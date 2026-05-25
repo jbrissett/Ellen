@@ -3381,6 +3381,135 @@ def _group_locations_for_qchub(request: StudyRequest) -> list[dict[str, Any]]:
     return list(groups.values())
 
 
+def _wait_for_form_populated_before_submit(
+    page: Page, log: ProgressCallback, *, budget_sec: float = 20.0,
+) -> None:
+    """Positive-signal gate before SUBMIT REQUEST. Polls until qchub's
+    Angular state reports a non-empty `alertsRequest` array (the array
+    of study line items the submit handler validates) OR the visible
+    form shows at least one expanded location row in a study group.
+
+    Why: qchub's KML upload is async server-side. The Playwright file
+    chooser interaction completes the upload start, but qchub then
+    server-side parses + binds the parsed locations to the current
+    group's Angular state. That bind can take 5-20s on a slow server
+    response. If we click SUBMIT REQUEST during the bind window, the
+    submit handler sees `alertsRequest.length === 0` and silently
+    rejects the form with the "review empty 1 location" toast (which
+    auto-dismisses before any post-submit diagnostic can catch it).
+
+    Two signals checked each poll cycle (return True on either):
+      1. qchub's own console-log telemetry: each Angular state cycle
+         emits `this.alertsRequest.length N`. A `pageerror` / `console`
+         listener watches for N > 0.
+      2. DOM-side fallback: count visible elements inside the group
+         expander that look like location rows (have a remove/checkbox
+         control). Lower-fidelity but resilient to qchub deleting the
+         telemetry log line in a future build.
+
+    On timeout, raises QchubError with a clear message instead of
+    letting the silent-reject path swallow the run. The user can
+    re-try; usually the upload completes in 5-10s on retry.
+
+    Established 2026-05-25 from order-176588-adjacent failed Winchester
+    run; user pasted dev console showing alertsRequest.length 0 at
+    submit time.
+    """
+    import time as _time
+    deadline = _time.monotonic() + budget_sec
+
+    # Set up console-log listener for qchub's `alertsRequest.length N` telemetry.
+    # Each Angular state cycle re-emits this; we watch for any N >= 1.
+    alerts_seen_nonzero = [False]
+    last_alerts_count = [0]
+
+    def _on_console(msg) -> None:
+        try:
+            text = msg.text
+        except Exception:
+            return
+        # Pattern: "this.alertsRequest.length N" — qchub logs this on
+        # every state mutation. Match defensively in case the prefix
+        # text shifts in a future qchub build.
+        m = re.search(r"alertsRequest\.length\s+(\d+)", text)
+        if m:
+            n = int(m.group(1))
+            last_alerts_count[0] = n
+            if n >= 1:
+                alerts_seen_nonzero[0] = True
+
+    try:
+        page.on("console", _on_console)
+    except Exception as exc:
+        log(f"  (couldn't attach console listener for submit-gate: {exc})")
+
+    log("  Waiting for KML upload to bind to the group before submit…")
+    poll_count = 0
+    try:
+        while _time.monotonic() < deadline:
+            poll_count += 1
+
+            # Signal 1: did we ever see alertsRequest.length >= 1 emitted?
+            if alerts_seen_nonzero[0]:
+                log(f"  ✓ alertsRequest populated (count {last_alerts_count[0]}); safe to submit.")
+                return
+
+            # Signal 2: visible location-row count in the form. We probe
+            # the page's body innerText looking for content that grows
+            # as locations bind. Cheap defensive cross-check.
+            try:
+                visible_marker_count = page.evaluate(
+                    r"""() => {
+                        // Look for location entries in a study group panel.
+                        // qchub renders these as horizontal rows with a
+                        // checkbox/remove control + site label. We count
+                        // any visible input[type=checkbox] inside the
+                        // study-group area on the left half of the page.
+                        const candidates = document.querySelectorAll(
+                            'input[type="checkbox"], button[aria-label*="remove" i], '
+                            + 'button[title*="delete" i], .location-checkbox'
+                        );
+                        let visible = 0;
+                        for (const el of candidates) {
+                            const r = el.getBoundingClientRect();
+                            if (r.width > 0 && r.height > 0 && r.left < window.innerWidth / 2) {
+                                visible += 1;
+                            }
+                        }
+                        return visible;
+                    }"""
+                )
+                if isinstance(visible_marker_count, int) and visible_marker_count >= 1:
+                    log(
+                        f"  ✓ {visible_marker_count} location row(s) visible in group panel; "
+                        "safe to submit."
+                    )
+                    return
+            except Exception:
+                pass
+
+            # Throw a small Angular nudge — clicking somewhere on a benign
+            # element forces a digest cycle, prompting fresh telemetry.
+            # Use the body element so we don't trigger anything destructive.
+            # (Disabled — too risky; just wait. Re-enable if listener-only
+            # signal proves insufficient on real runs.)
+
+            page.wait_for_timeout(500)  # 500ms between polls
+
+        # Timeout — bail loudly. Don't let the silent submit-rejection happen.
+        raise QchubError(
+            f"KML upload didn't finish binding to the group within {budget_sec:.0f}s "
+            f"(alertsRequest never went non-zero). qchub would silently reject "
+            "the submit. Try again — usually completes in 5-10s on retry."
+        )
+    finally:
+        # Always detach the listener so it doesn't leak into the next page action.
+        try:
+            page.remove_listener("console", _on_console)
+        except Exception:
+            pass
+
+
 def _submit_request(page: Page, log: ProgressCallback) -> tuple[Optional[str], Optional[str]]:
     """Click SUBMIT REQUEST, dismiss the 'Thank you' confirmation, capture order ID.
 
@@ -3389,6 +3518,11 @@ def _submit_request(page: Page, log: ProgressCallback) -> tuple[Optional[str], O
          request. Your order has been submitted." with an OK button.
       2. Clicking OK redirects to /Admin/Orders/{order_id} where the new
          order ID is in the URL path.
+
+    See _wait_for_form_populated_before_submit for the positive-signal
+    gate that fires before the click — added 2026-05-25 after a silent
+    submit-rejection caused by clicking before the KML upload finished
+    binding to the group server-side.
     """
     # qchub auto-re-opens the Add Study Group dialog after the last group is
     # created, and the Info Alert can resurface after KML upload. Either of
@@ -3397,6 +3531,25 @@ def _submit_request(page: Page, log: ProgressCallback) -> tuple[Optional[str], O
     # itself is in the DOM. Clear both defensively before clicking.
     _dismiss_add_group_dialog_if_open(page, log)
     _dismiss_info_alert(page, log)
+
+    # POSITIVE COMPLETION GATE before submitting. qchub's KML upload is
+    # async server-side: it can take 5-20s for the parsed locations to
+    # bind to the group in Angular state. If we click SUBMIT REQUEST
+    # before that bind completes, qchub silently rejects the form with
+    # "review empty 1 location" because its internal `alertsRequest`
+    # array is empty even though we visibly added a group + uploaded
+    # a KML.
+    #
+    # Observed run-20260525-132312 (Winchester order — failed silently).
+    # User pasted dev console: "this.alertsRequest.length 0" at submit
+    # time. Only 8s elapsed between KML upload + submit click; not
+    # enough on a slow server response.
+    #
+    # Fix: poll for visible location rows in the group panel before
+    # clicking. Gate on the OUTCOME (rows visible) not a fixed sleep
+    # (per feedback_completion_signals.md). On timeout, bail with a
+    # clear actionable error rather than submitting an empty form.
+    _wait_for_form_populated_before_submit(page, log)
 
     try:
         page.get_by_role("button", name=re.compile(r"submit\s*request", re.IGNORECASE)).first.click(timeout=10_000)
