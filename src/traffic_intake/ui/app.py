@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSplitter,
     QStatusBar,
+    QSystemTrayIcon,
     QToolBar,
     QVBoxLayout,
     QWidget,
@@ -28,6 +29,7 @@ from ..qchub import CreateOrderResult
 from .chat_panel import ChatPanel
 from .drop_zone import DropZone
 from .extraction_panel import ExtractionPanel
+from .floating_reply import FloatingReplyWidget
 from .outlook_picker import NoSelection, OutlookUnavailable, import_selected_email
 from .settings_dialog import SettingsDialog
 from .workers import run_chat, run_email_draft, run_extraction, run_mymaps_creation, run_qchub_creation
@@ -56,10 +58,154 @@ class MainWindow(QMainWindow):
         self._build_central()
         self.setStatusBar(QStatusBar())
 
+        # System tray icon + interactive reply pop-up. Tray gives the
+        # user a passive "Ellen is running" indicator in the taskbar
+        # corner + handles `showMessage` toasts when background jobs
+        # complete. Floating reply widget appears when Ellen asks a
+        # question and the app isn't in focus — user can reply directly
+        # without finding the app window.
+        self._build_system_tray()
+        self._floating_reply: FloatingReplyWidget | None = None
+
         if not self._has_api_key():
             self.status("No Anthropic API key saved — open Settings to add one.")
         else:
             self.status("Ready. Drop an email or use 'Import from Outlook'.")
+
+    # ----- system tray + notifications -----
+
+    def _build_system_tray(self) -> None:
+        """Install a system tray icon for background-job notifications.
+
+        Uses the window's own icon; if the platform doesn't support a
+        tray (rare on Windows but possible on locked-down machines),
+        we degrade silently — `notify()` will skip the toast but the
+        in-app status bar still updates.
+        """
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self._tray = None
+            return
+        icon = self.windowIcon()
+        if icon.isNull():
+            # No window icon yet (set later by the bootstrap). Use Qt's
+            # standard message-box icon as a placeholder so the tray
+            # entry still appears.
+            from PySide6.QtWidgets import QStyle
+            icon = self.style().standardIcon(QStyle.StandardPixmap.SP_MessageBoxInformation)
+        self._tray = QSystemTrayIcon(icon, self)
+        self._tray.setToolTip("Ellen — workplace assistant")
+        # Single-click the tray icon → raise + activate the main window.
+        # Right-click for native context menu (close, etc.) added later
+        # if needed; left-click is the primary "bring me back" gesture.
+        self._tray.activated.connect(self._on_tray_activated)
+        self._tray.show()
+
+    def _on_tray_activated(self, reason) -> None:
+        """Bring the main window forward when the user clicks the tray icon."""
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self._bring_to_front()
+
+    def _bring_to_front(self) -> None:
+        """Raise + activate the main window, restoring from minimized
+        if needed. Used by the tray click and floating-reply 'open chat'.
+        """
+        self.setWindowState(
+            (self.windowState() & ~Qt.WindowState.WindowMinimized)
+            | Qt.WindowState.WindowActive
+        )
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def notify(
+        self,
+        title: str,
+        message: str,
+        *,
+        urgent: bool = False,
+        timeout_ms: int = 5000,
+    ) -> None:
+        """Surface a Windows toast via the system tray icon. No-op if
+        the tray isn't available. Always updates the status bar too so
+        the info is visible without the toast.
+        """
+        self.status(message)
+        if getattr(self, "_tray", None) is None:
+            return
+        icon_kind = (
+            QSystemTrayIcon.MessageIcon.Critical
+            if urgent
+            else QSystemTrayIcon.MessageIcon.Information
+        )
+        try:
+            self._tray.showMessage(title, message, icon_kind, timeout_ms)
+        except Exception:
+            # Never let a notification error kill the calling flow.
+            pass
+
+    def _maybe_show_floating_reply(self) -> None:
+        """If Ellen's last assistant message looks like a question AND
+        the main window isn't currently active, surface the floating
+        reply widget so the user can answer without alt-tabbing.
+
+        Heuristic for 'question': the last assistant text in chat
+        history ends with '?' (after stripping trailing whitespace).
+        Quick to ship; if it gets noisy we can tighten later (e.g.,
+        require a tool that explicitly marks the question).
+        """
+        if self.isActiveWindow():
+            return  # user is looking at the app — no popup needed
+        last_assistant_text = self._extract_last_assistant_text()
+        if not last_assistant_text:
+            return
+        if not last_assistant_text.rstrip().endswith("?"):
+            return
+        # Replace any existing widget — only one open at a time.
+        if self._floating_reply is not None:
+            try:
+                self._floating_reply.close()
+            except Exception:
+                pass
+            self._floating_reply = None
+        widget = FloatingReplyWidget(
+            last_assistant_text, on_send=self._on_floating_reply_send,
+        )
+        self._floating_reply = widget
+        widget.show_to_user()
+        # Also fire a tray toast so a user who's deep in another app
+        # gets the OS-level notification chime even if their attention
+        # isn't on the screen corner.
+        self.notify("Ellen has a question", _shorten(last_assistant_text, 120))
+
+    def _on_floating_reply_send(self, reply_text: str) -> None:
+        """Floating reply widget callback — route the typed reply
+        through the same chat send path the main panel uses."""
+        self._floating_reply = None
+        # Bring the app forward so the chat is visible while Ellen
+        # processes the reply; the user can choose to alt-tab away
+        # again if they want.
+        self._bring_to_front()
+        self.on_chat_send(reply_text)
+
+    def _extract_last_assistant_text(self) -> str:
+        """Pull the last assistant text block out of chat history."""
+        for msg in reversed(self._chat_history or []):
+            if msg.get("role") != "assistant":
+                continue
+            content = msg.get("content")
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                texts = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        t = block.get("text") or ""
+                        if t:
+                            texts.append(t)
+                if texts:
+                    return "".join(texts)
+            return ""
+        return ""
 
     # ----- layout -----
 
@@ -313,6 +459,11 @@ class MainWindow(QMainWindow):
             self.chat_panel.appendSystemNote(
                 "<i>Session closed. Drop another email to start a new one.</i>"
             )
+        # If Ellen asked a question AND the user isn't looking at the
+        # app, surface the floating reply widget so they can answer
+        # without finding the window. (See _maybe_show_floating_reply
+        # for the question-detection heuristic.)
+        self._maybe_show_floating_reply()
 
     def _on_chat_failed(self, message: str) -> None:
         self.chat_panel.appendSystemNote(
@@ -443,6 +594,13 @@ class MainWindow(QMainWindow):
         self.btn_qchub.setEnabled(True)
         self.drop_zone.setBusy(False)
         self.status(f"qchub order created (id={result.order_id or 'unknown'}).")
+        # Toast — useful in headless mode where the user has no browser
+        # to watch. Mentions the order ID so the notification is
+        # actionable on its own.
+        self.notify(
+            "qchub order created",
+            f"Order {result.order_id or 'created'} — estimate PDF saved to Downloads.",
+        )
 
         # Store artifacts so Ellen can refer back.
         self._artifacts["qchub_order_id"] = result.order_id
@@ -522,6 +680,7 @@ class MainWindow(QMainWindow):
         self.btn_qchub.setEnabled(True)
         self.drop_zone.setBusy(False)
         self.status("qchub automation failed.")
+        self.notify("qchub failed", _shorten(message, 200), urgent=True)
         QMessageBox.critical(self, "qchub failed", message)
 
     def _on_qchub_missing_company(self, name: str, domain: str) -> None:
@@ -554,6 +713,16 @@ class MainWindow(QMainWindow):
         self.btn_map.setEnabled(True)
         self.drop_zone.setBusy(False)
         self.status("MyMaps map created.")
+        # Toast — primary signal in headless mode where the map browser
+        # isn't visible. Includes the share link so the user can act on
+        # the notification directly.
+        if result.share_url:
+            self.notify(
+                "MyMaps map ready",
+                f"{result.map_title or 'Map'} — share link copied to clipboard.",
+            )
+        else:
+            self.notify("MyMaps map ready", result.map_title or "Map created.")
 
         # Store as session artifacts so Ellen can refer back to them.
         self._artifacts["mymaps_title"] = result.map_title
@@ -585,6 +754,7 @@ class MainWindow(QMainWindow):
         self.btn_map.setEnabled(True)
         self.drop_zone.setBusy(False)
         self.status("MyMaps automation failed.")
+        self.notify("MyMaps failed", _shorten(message, 200), urgent=True)
         # Mark the failure in artifacts so Ellen can detect it when the user
         # later asks for the map link. Without this, a failed MyMaps run is
         # indistinguishable from "still running" via `get_artifacts` — Ellen
@@ -870,6 +1040,7 @@ class MainWindow(QMainWindow):
     def _on_extraction_failed(self, message: str) -> None:
         self.drop_zone.setBusy(False)
         self.status("Extraction failed.")
+        self.notify("Extraction failed", _shorten(message, 200), urgent=True)
         QMessageBox.critical(self, "Extraction failed", message)
 
     def on_settings(self) -> None:
@@ -890,6 +1061,14 @@ def _safe_filename(s: str) -> str:
     bad = '<>:"/\\|?*\n\r\t'
     out = "".join("_" if ch in bad else ch for ch in s).strip()
     return out[:120] or "traffic_study"
+
+
+def _shorten(s: str, max_chars: int) -> str:
+    """Truncate a long message to fit in a toast notification."""
+    s = (s or "").strip().replace("\n", " ").replace("\r", " ")
+    if len(s) <= max_chars:
+        return s
+    return s[: max_chars - 1].rstrip() + "…"
 
 
 def main() -> int:

@@ -812,9 +812,14 @@ def _run(
     last_err: Optional[BaseException] = None
     for channel in ("msedge", None):
         try:
+            from .runtime_settings import is_headless_mode
             kwargs: dict = dict(
                 user_data_dir=str(profile_dir),
-                headless=False,
+                # Headless toggle is a user-settable preference (Settings
+                # dialog) — production / mass-deploy installs default ON
+                # so qchub automation runs invisibly; dev / diagnostic
+                # runs default OFF so the user can watch.
+                headless=is_headless_mode(),
                 viewport={"width": 1400, "height": 900},
                 accept_downloads=True,
                 # Drop the --enable-automation switch. User confirmed

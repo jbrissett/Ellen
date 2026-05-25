@@ -118,6 +118,23 @@ class SettingsDialog(QDialog):
         )
         layout.addWidget(self.show_mymaps_confirm)
 
+        # Headless mode — when on, MyMaps and qchub Playwright sessions
+        # launch invisibly. Mass-deploy default is ON (set by the
+        # installer). Dev / diagnostic default is OFF so the user can
+        # watch the browser drive through the workflow.
+        from ..runtime_settings import is_headless_mode
+        self.headless_checkbox = QCheckBox(
+            "Run browsers invisibly (headless mode) — recommended for everyday use"
+        )
+        self.headless_checkbox.setChecked(is_headless_mode())
+        self.headless_checkbox.setToolTip(
+            "On: MyMaps and qchub run in the background — you'll get a "
+            "notification when Ellen needs you, but the browsers don't pop up.\n"
+            "Off: Browsers open visibly so you can watch the automation. "
+            "Useful for diagnostics or first-time verification."
+        )
+        layout.addWidget(self.headless_checkbox)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
@@ -163,6 +180,8 @@ class SettingsDialog(QDialog):
         settings.setValue(
             "chat_model", self.chat_model_combo.currentData() or "auto",
         )
+        from ..runtime_settings import set_headless_mode
+        set_headless_mode(self.headless_checkbox.isChecked())
 
         user = self.qchub_user_input.text().strip()
         pw = self.qchub_pass_input.text()
