@@ -86,8 +86,10 @@ class GeocodeResult:
     formatted_address: str
     # Source tier (richer than the original Google-only location_type):
     #   OSM_NODE                — Overpass found the actual intersection node (best)
-    #   PLACES_NEW_INTERSECTION — Places (New) searchText with includedType=intersection
+    #   PLACES_NEW_INTERSECTION — Places (New) searchText, types=['intersection']
     #   PLACES_NEW_CANONICAL    — same as above, after Autocomplete canonicalize pre-pass
+    #   PLACES_NEW_POI          — Places (New) searchText, nearest POI fallback
+    #                             (when no intersection-typed place existed)
     #   ROOFTOP / RANGE_INTERPOLATED / GEOMETRIC_CENTER — legacy Geocoding API
     #   PLACES_FIND             — legacy Places Find Place from Text fallback
     #   APPROXIMATE             — legacy Geocoding city-level pin (last resort)
@@ -108,6 +110,11 @@ class GeocodeResult:
             # Within-intersection precision but not nailed to a specific
             # node. Usually fine for a map pin; user should glance.
             return "medium"
+        if self.location_type == "PLACES_NEW_POI":
+            # Nearest POI to the named streets — usually within ~50m of
+            # the actual crosswalk. Useful as a "general location" pin
+            # the user can nudge, but always flag for verification.
+            return "low"
         return "low"  # APPROXIMATE
 
 
@@ -483,23 +490,43 @@ def _overpass_intersection(
 
 def _places_new_search_text(
     query: str, bbox: Optional[dict], api_key: str,
+    *, include_intersection_only: bool = True,
 ) -> Optional[GeocodeResult]:
-    """POST to Places API (New) `places:searchText` with intersection type
-    + optional bbox restriction. Returns the top result's coords on hit.
+    """POST to Places API (New) `places:searchText` with bbox bias.
+    Returns the top result's coords on hit.
 
-    Tagged `PLACES_NEW_INTERSECTION` so confidence reports "medium".
-    Caller should call _places_new_search_text_canonical() as a follow-up
-    if this returns None.
+    Two important Google-API quirks established 2026-05-25 by live tests:
+
+      1. `includedType="intersection"` is INVALID — the API returns
+         HTTP 400 "Invalid included_type". The published docs imply it
+         works, but the supported-types list rejects it. So we filter
+         intersection-vs-not in Python from the returned `types` array.
+
+      2. `locationRestriction.rectangle` HARD-FILTERS — and Google's
+         intersection-typed places appear to be stored at coordinates
+         that often sit just outside a city's tight viewport rectangle.
+         A restriction box that's right-sized for the city CUTS OUT
+         the intersection results we want. Use `locationBias` instead
+         (soft preference). Empirically: with `locationBias`,
+         "Senseny Road & Greenwood Road" returns a `types=['intersection']`
+         result; with `locationRestriction` on the same bbox, 0 results.
+
+    When `include_intersection_only=True` (the default for the
+    intersection chain), we keep only results whose `types` array
+    contains "intersection" — drops POIs (restaurants, malls) that
+    happen to sit near the named streets. Caller can pass False to
+    accept POI matches as approximate fallbacks.
     """
     body: dict = {
         "textQuery": query,
-        "includedType": "intersection",
         "languageCode": "en",
         "regionCode": "US",
         "maxResultCount": 5,
     }
     if bbox is not None:
-        body["locationRestriction"] = {"rectangle": bbox}
+        # locationBias (soft) rather than locationRestriction (hard).
+        # Same shape — the rectangle structure is identical.
+        body["locationBias"] = {"rectangle": bbox}
     headers = {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": api_key,
@@ -533,7 +560,23 @@ def _places_new_search_text(
     places = data.get("places") or []
     if not places:
         return None
-    top = places[0]
+    # When include_intersection_only=True, prefer results with the
+    # `intersection` type (Google's place graph DOES carry that type;
+    # just rejects it as an includedType filter). Filtering after the
+    # fact avoids both the 400 and the empty-result-on-restriction
+    # problem documented above.
+    if include_intersection_only:
+        intersection_places = [
+            p for p in places if "intersection" in (p.get("types") or [])
+        ]
+        if intersection_places:
+            top = intersection_places[0]
+            location_type = "PLACES_NEW_INTERSECTION"
+        else:
+            return None
+    else:
+        top = places[0]
+        location_type = "PLACES_NEW_POI"  # POI near the named streets — approximate
     loc = top.get("location") or {}
     if "latitude" not in loc or "longitude" not in loc:
         return None
@@ -541,7 +584,7 @@ def _places_new_search_text(
         latitude=float(loc["latitude"]),
         longitude=float(loc["longitude"]),
         formatted_address=top.get("formattedAddress", ""),
-        location_type="PLACES_NEW_INTERSECTION",
+        location_type=location_type,
         place_id=top.get("id"),
     )
 
@@ -609,10 +652,28 @@ def _places_new_autocomplete_route(
 def _intersection_chain(
     parsed: dict, api_key: str,
 ) -> Optional[GeocodeResult]:
-    """Walk the intersection-aware chain: Overpass → Places New → canonicalize+retry.
+    """Walk the intersection-aware chain.
 
-    Returns the first hit, or None if every tier missed. Caller is
-    responsible for the legacy-API last-resort fallback.
+    Restructured 2026-05-25 after live testing showed:
+      - searchText with `includedType="intersection"` zero-results even
+        on known-good intersections (filter removed; see helper docstring)
+      - Autocomplete canonicalizes street names reliably ("Apple Blossom
+        Mall Drive" → "Apple Blossom Drive"), which often unlocks an
+        Overpass hit that the raw names would have missed
+      - Overpass with the CANONICAL names returns exact node coords for
+        free, so the Autocomplete pre-pass should run BEFORE Places
+        searchText, not after it
+
+    Order (accuracy + cost optimized):
+      1. Overpass with raw names           — free, exact when works
+      2. Autocomplete each street          — paid (~$0.006 / pair)
+      3. Overpass with CANONICAL names     — free, exact when works
+      4. Places searchText, canonical query — paid (~$0.032)
+      5. Places searchText, raw query      — paid (~$0.032) — defense
+                                              against Autocomplete failure
+      6. (caller) legacy Geocoding fallback
+
+    Returns first hit. None if every tier missed.
     """
     street_a, street_b = parsed["street_a"], parsed["street_b"]
     city, state = parsed["city"], parsed["state"]
@@ -622,38 +683,72 @@ def _intersection_chain(
     # only pay this Geocoding call once.
     bbox = _locality_bbox(city, state, api_key)
 
-    # Tier 1: Overpass (free, exact node coords when found).
-    # Bbox-scoped, not admin-area-scoped — many "City, State" addresses are
-    # actually just outside the city's admin boundary. Verified 2026-05-25:
-    # Senseny × Greenwood in "Winchester VA" only resolves via bbox; the
-    # node itself is in Frederick County.
+    # Tier 1: Overpass with raw names.
     result = _overpass_intersection(street_a, street_b, city, state, bbox=bbox)
     if result is not None:
-        log.info("Overpass HIT %r × %r in %s — exact node coords.",
+        log.info("Tier 1 (Overpass raw) HIT %r × %r in %s — exact node.",
                  street_a, street_b, city)
         return result
 
-    # Tier 2: Places (New) searchText with bbox + intersection type. Drop the
-    # city from the query text since it's already in the bbox restriction;
-    # Places ranks by proximity to the restricted area.
-    query = f"{street_a} & {street_b}"
-    result = _places_new_search_text(query, bbox, api_key)
-    if result is not None:
-        log.info("Places (New) searchText HIT for %r in %s.", query, city)
-        return result
-
-    # Tier 3: Canonicalize each street via Autocomplete, then retry searchText.
+    # Tier 2: Canonicalize each street via Places (New) Autocomplete.
+    # This is paid (~$0.003 per call × 2 = ~$0.006 per intersection) but
+    # unlocks both Tier 3 (free Overpass retry) and Tier 4 (better Places
+    # searchText hit rate).
     canon_a = _places_new_autocomplete_route(street_a, bbox, api_key) or street_a
     canon_b = _places_new_autocomplete_route(street_b, bbox, api_key) or street_b
-    if (canon_a, canon_b) != (street_a, street_b):
-        query2 = f"{canon_a} & {canon_b}"
-        log.info("Autocomplete canonicalized %r×%r → %r×%r — retrying searchText.",
-                 street_a, street_b, canon_a, canon_b)
-        result = _places_new_search_text(query2, bbox, api_key)
+    canonicalized = (canon_a, canon_b) != (street_a, street_b)
+    if canonicalized:
+        log.info("Autocomplete canonicalized: %r → %r ; %r → %r",
+                 street_a, canon_a, street_b, canon_b)
+
+    # Tier 3: Overpass with CANONICAL names — free, often picks up the
+    # cases where the LLM-extracted name had an extra descriptor that
+    # threw the OSM regex match off.
+    if canonicalized:
+        result = _overpass_intersection(canon_a, canon_b, city, state, bbox=bbox)
         if result is not None:
-            # Tag with the canonical tier so confidence reporting can
-            # distinguish "needed canonicalize step" from "first-try hit."
+            log.info("Tier 3 (Overpass canonical) HIT %r × %r in %s — exact node.",
+                     canon_a, canon_b, city)
+            return result
+
+    # Tier 4a: Places (New) searchText, canonical names, intersection-only.
+    # Returns exact-intersection coords when Google's place graph has the
+    # cross-street indexed as type='intersection' (best paid case).
+    query_canon = f"{canon_a} & {canon_b}"
+    result = _places_new_search_text(
+        query_canon, bbox, api_key, include_intersection_only=True,
+    )
+    if result is not None:
+        if canonicalized:
             result.location_type = "PLACES_NEW_CANONICAL"
+        log.info("Tier 4a (Places searchText canonical, intersection) HIT for %r in %s.",
+                 query_canon, city)
+        return result
+
+    # Tier 4b: Places searchText, canonical names, POI-tolerant.
+    # When Google has no intersection-typed entry, returns the nearest
+    # POI to the named streets — coords are usually within ~50m of the
+    # actual crosswalk. Tagged PLACES_NEW_POI so the user knows to
+    # verify the pin (and tracks as "medium" confidence).
+    result = _places_new_search_text(
+        query_canon, bbox, api_key, include_intersection_only=False,
+    )
+    if result is not None:
+        log.info("Tier 4b (Places searchText canonical, POI fallback) HIT for %r in %s — verify pin.",
+                 query_canon, city)
+        return result
+
+    # Tier 5: Places searchText with raw names, POI-tolerant — final
+    # defense against Autocomplete returning a wrong canonical that
+    # broke the search.
+    if canonicalized:
+        query_raw = f"{street_a} & {street_b}"
+        result = _places_new_search_text(
+            query_raw, bbox, api_key, include_intersection_only=False,
+        )
+        if result is not None:
+            log.info("Tier 5 (Places searchText raw, POI fallback) HIT for %r in %s — verify pin.",
+                     query_raw, city)
             return result
     return None
 
