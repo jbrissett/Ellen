@@ -73,10 +73,12 @@ OVERPASS_URL = "https://overpass-api.de/api/interpreter"
 # in giving each call longer. With parallelization (one thread per address)
 # the per-call ceiling matters more than the per-address total.
 REQUEST_TIMEOUT_SEC = 10
-# Overpass can be a little slower than Google APIs (it executes a real query
-# against the planet OSM database). 20s gives the public endpoint headroom
-# without locking up the extraction phase.
-OVERPASS_TIMEOUT_SEC = 20
+# Overpass executes against the planet OSM database, so it's slower
+# than a Google point-lookup. 10s is enough for the bbox-scoped
+# intersection queries we issue (verified — successful hits return
+# in <2s). Lowered from 20s 2026-05-25 to keep the per-address
+# worst-case time bounded under the geocoder phase budget.
+OVERPASS_TIMEOUT_SEC = 10
 
 
 @dataclass

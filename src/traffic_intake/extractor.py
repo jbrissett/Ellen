@@ -554,7 +554,12 @@ def _refine_estimates_via_geocoding(request: StudyRequest) -> None:
     sees a clear "N of M addresses needed manual verification" warning surfaced
     via the location's `estimate.notes`.
     """
-    PHASE_BUDGET_SEC = 120  # generous cap; healthy parallel case finishes in <15s
+    # 90s cap (was 120) — per-address worst case is ~70s under the 5-tier
+    # chain (Overpass 10s + Autocomplete×2 20s + Overpass canonical 10s +
+    # Places×3 30s), parallelized across all addresses. 90s gives the
+    # slowest single address full headroom but bails on a stuck batch
+    # fast enough that the user doesn't sit watching a spinner for 2 minutes.
+    PHASE_BUDGET_SEC = 90
 
     try:
         api_key = geocoder.get_google_geocoding_key()
@@ -601,36 +606,55 @@ def _refine_estimates_via_geocoding(request: StudyRequest) -> None:
     # ceiling (don't unleash 200 threads on a giant KMZ).
     n_workers = min(len(work), 12)
     started_at = time.monotonic()
+    # IMPORTANT: as_completed(timeout=...) raises concurrent.futures.TimeoutError
+    # when the deadline hits, and that exception isn't caught by the per-future
+    # try/except inside the loop. The whole `_refine_estimates_via_geocoding`
+    # function would crash on the bubble-up, taking the extraction worker
+    # with it (the UI then shows "Extraction failed" even though extraction
+    # itself succeeded). Catch it at the outer scope and treat the still-in-
+    # flight addresses as abandoned (they keep their LLM estimates).
+    # Established 2026-05-25 after the user saw this exact failure mode on
+    # an 8-intersection email post-chain-rewrite.
+    from concurrent.futures import TimeoutError as FutTimeoutError
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
         futures = {pool.submit(_one, idx, addr): (idx, addr) for idx, addr in work}
-        for fut in as_completed(futures, timeout=PHASE_BUDGET_SEC):
-            try:
-                idx, addr, result, exc = fut.result()
-            except Exception as result_exc:
-                idx, addr = futures[fut]
-                exc = result_exc
-                result = None
-            if exc is not None:
-                log.warning("Geocode failed for %r: %s", addr, exc)
-                failed += 1
-                continue
-            if result is None:
-                log.info("No geocoding results for %r (all variants + Places fallback exhausted)", addr)
-                failed += 1
-                continue
-            request.locations[idx].estimate = LocationEstimate(
-                latitude=result.latitude,
-                longitude=result.longitude,
-                confidence=result.confidence,
-                source="geocoded",
-                notes=f"Google {result.location_type}: {result.formatted_address}",
+        try:
+            for fut in as_completed(futures, timeout=PHASE_BUDGET_SEC):
+                try:
+                    idx, addr, result, exc = fut.result()
+                except Exception as result_exc:
+                    idx, addr = futures[fut]
+                    exc = result_exc
+                    result = None
+                if exc is not None:
+                    log.warning("Geocode failed for %r: %s", addr, exc)
+                    failed += 1
+                    continue
+                if result is None:
+                    log.info("No geocoding results for %r (all variants + Places fallback exhausted)", addr)
+                    failed += 1
+                    continue
+                request.locations[idx].estimate = LocationEstimate(
+                    latitude=result.latitude,
+                    longitude=result.longitude,
+                    confidence=result.confidence,
+                    source="geocoded",
+                    notes=f"Google {result.location_type}: {result.formatted_address}",
+                )
+                if result.confidence == "high":
+                    geocoded_high += 1
+                elif result.confidence == "medium":
+                    geocoded_medium += 1
+                else:
+                    geocoded_low += 1
+        except FutTimeoutError:
+            # Phase budget exceeded — proceed with whatever completed.
+            # The abandoned-count logic below logs the partial state.
+            log.warning(
+                "Geocoder phase exceeded %ds budget — proceeding with partial results "
+                "(still-in-flight addresses keep their LLM-estimated coords).",
+                PHASE_BUDGET_SEC,
             )
-            if result.confidence == "high":
-                geocoded_high += 1
-            elif result.confidence == "medium":
-                geocoded_medium += 1
-            else:
-                geocoded_low += 1
 
     elapsed = time.monotonic() - started_at
     # Anything still in flight past PHASE_BUDGET_SEC fell off as_completed
