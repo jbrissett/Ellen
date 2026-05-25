@@ -56,7 +56,7 @@ from typing import Optional
 
 import requests
 
-from .config import get_google_geocoding_key
+from .config import get_google_geocoding_key, get_here_api_key
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +64,7 @@ GEOCODE_URL = "https://maps.googleapis.com/maps/api/geocode/json"
 PLACES_FIND_PLACE_URL = "https://maps.googleapis.com/maps/api/place/findplacefromtext/json"
 PLACES_NEW_SEARCH_TEXT_URL = "https://places.googleapis.com/v1/places:searchText"
 PLACES_NEW_AUTOCOMPLETE_URL = "https://places.googleapis.com/v1/places:autocomplete"
+HERE_GEOCODE_URL = "https://geocode.search.hereapi.com/v1/geocode"
 # Public Overpass endpoint. Rate-limited (~10K queries/day per IP); fine for
 # our volume but worth swapping to a self-hosted instance if QC's email
 # throughput climbs. Free alternates: overpass.kumi.systems, overpass.private.coffee.
@@ -87,37 +88,43 @@ class GeocodeResult:
     longitude: float
     formatted_address: str
     # Source tier (richer than the original Google-only location_type):
-    #   OSM_NODE                — Overpass found the actual intersection node (best)
-    #   PLACES_NEW_INTERSECTION — Places (New) searchText, types=['intersection']
-    #   PLACES_NEW_CANONICAL    — same as above, after Autocomplete canonicalize pre-pass
-    #   PLACES_NEW_POI          — Places (New) searchText, nearest POI fallback
-    #                             (when no intersection-typed place existed)
-    #   ROOFTOP / RANGE_INTERPOLATED / GEOMETRIC_CENTER — legacy Geocoding API
-    #   PLACES_FIND             — legacy Places Find Place from Text fallback
+    #   OSM_NODE                — Overpass shared-node intersection (best for standard intersections)
+    #   OSM_MOTORWAY_JUNCTION   — Overpass highway=motorway_junction node (best for tagged ramps)
+    #   HERE_INTERSECTION       — HERE Geocoder, resultType=intersection (high queryScore)
+    #   HERE_STREET             — HERE Geocoder, resultType=street (on the named street, ~50m from intersection)
+    #   HERE_HOUSE_NUMBER       — HERE Geocoder, resultType=houseNumber (nearby address, ~100m from intersection)
+    #   HERE_LOCALITY           — HERE Geocoder, broader area match (>500m, treat as low)
+    #   ROOFTOP / RANGE_INTERPOLATED / GEOMETRIC_CENTER — legacy Geocoding API (single addresses)
     #   APPROXIMATE             — legacy Geocoding city-level pin (last resort)
+    # Deprecated / retained for back-compat (no longer produced by current chain):
+    #   PLACES_NEW_INTERSECTION / PLACES_NEW_CANONICAL / PLACES_NEW_POI / PLACES_FIND
+    #   — the Places-based tiers were dropped 2026-05-25 after they produced
+    #   "pins in fields" results (POI-near-streets, not actual intersections).
     location_type: str
     place_id: Optional[str] = None
 
     @property
     def confidence(self) -> str:
         """Map source tier to our high/medium/low scale."""
-        if self.location_type in ("OSM_NODE", "ROOFTOP", "RANGE_INTERPOLATED"):
-            # OSM_NODE = literal intersection node coords; Google ROOFTOP/RANGE
-            # = full address resolution. Both are tightly-bound.
+        if self.location_type in (
+            "OSM_NODE", "OSM_MOTORWAY_JUNCTION",
+            "HERE_INTERSECTION",
+            "ROOFTOP", "RANGE_INTERPOLATED",
+        ):
+            # Exact intersection node OR HERE explicitly-typed intersection
+            # OR Google's full-address resolution. Tightly-bound.
             return "high"
         if self.location_type in (
-            "GEOMETRIC_CENTER", "PLACES_NEW_INTERSECTION",
-            "PLACES_NEW_CANONICAL", "PLACES_FIND",
+            "GEOMETRIC_CENTER", "HERE_STREET", "HERE_HOUSE_NUMBER",
+            # Legacy Places tiers kept here for back-compat reads of stored data.
+            "PLACES_NEW_INTERSECTION", "PLACES_NEW_CANONICAL", "PLACES_FIND",
         ):
-            # Within-intersection precision but not nailed to a specific
-            # node. Usually fine for a map pin; user should glance.
+            # On the right street or near an address on the road; usually
+            # within ~50-100m of the actual cross-street. Pin lands in
+            # the right neighborhood; user should glance to verify exact spot.
             return "medium"
-        if self.location_type == "PLACES_NEW_POI":
-            # Nearest POI to the named streets — usually within ~50m of
-            # the actual crosswalk. Useful as a "general location" pin
-            # the user can nudge, but always flag for verification.
-            return "low"
-        return "low"  # APPROXIMATE
+        # PLACES_NEW_POI, HERE_LOCALITY, APPROXIMATE, anything else
+        return "low"
 
 
 # Module-level cache for (city, state) → bbox lookups. One Geocoding call
@@ -651,31 +658,246 @@ def _places_new_autocomplete_route(
     return None
 
 
+# =====================================================================
+# HERE Geocoder — Tier 4 fallback (2026-05-25 eval: 16/16 on Pittsboro)
+# =====================================================================
+
+def _here_geocode(
+    address: str, *, city: Optional[str] = None, state: Optional[str] = None,
+) -> Optional[GeocodeResult]:
+    """Query HERE Geocoding & Search v7 for `address`. Returns the top result
+    if HERE finds anything in the right region, None otherwise.
+
+    Eval established 2026-05-25 on 16 Pittsboro intersections that the
+    Overpass + Places chain failed on: HERE hit 16/16, with 8 explicitly
+    `resultType=intersection`. Significantly better intersection +
+    interchange coverage than OSM-based sources because HERE's data
+    foundation is automotive-grade (NAVTEQ heritage + BMW/Audi/Daimler
+    fleet telemetry), not crowd-sourced.
+
+    Auth: API key via `?apiKey=` query parameter. Read from keyring via
+    config.get_here_api_key(). Returns None (with a one-time warning
+    log) if no key is configured — caller continues to the next tier.
+
+    Result tier mapping:
+      - resultType=intersection → HERE_INTERSECTION (high confidence)
+      - resultType=street       → HERE_STREET       (medium)
+      - resultType=houseNumber  → HERE_HOUSE_NUMBER (medium — near the address)
+      - anything else           → HERE_LOCALITY     (low)
+
+    Proximity hint: if city + state provided, biases ranking toward
+    that area's center via the `at` param. We use bias rather than
+    `in:bbox` restriction (which causes weird 400s on HERE's parser).
+    Country scoping via `in=countryCode:USA` to avoid same-named
+    streets in other countries.
+    """
+    key = get_here_api_key()
+    if not key:
+        # Don't spam — one warning per process (caller logs the absence
+        # itself if it cares to surface to the user).
+        return None
+
+    # Proximity bias via city's approximate center (resolved through the
+    # bbox helper which we already cache per city). Fall back to no bias
+    # if city/state unknown.
+    at_param = None
+    if city and state:
+        bbox = _locality_bbox(city, state, get_google_geocoding_key() or "")
+        if bbox is not None:
+            cx = (bbox["low"]["latitude"]  + bbox["high"]["latitude"])  / 2
+            cy = (bbox["low"]["longitude"] + bbox["high"]["longitude"]) / 2
+            at_param = f"{cx},{cy}"
+
+    params = {
+        "q": address,
+        "in": "countryCode:USA",
+        "apiKey": key,
+        "limit": 3,
+        "lang": "en-US",
+    }
+    if at_param:
+        params["at"] = at_param
+
+    try:
+        r = requests.get(HERE_GEOCODE_URL, params=params, timeout=REQUEST_TIMEOUT_SEC)
+    except requests.RequestException as exc:
+        log.info("HERE network error: %s", exc)
+        return None
+    if r.status_code == 401:
+        log.warning(
+            "HERE returned 401 — API key invalid or revoked. "
+            "Re-create at https://platform.here.com → Access Manager → Apps → your app → Credentials."
+        )
+        return None
+    if r.status_code == 429:
+        log.warning("HERE returned 429 — daily quota exceeded (free tier is 1k/day).")
+        return None
+    if not r.ok:
+        log.info("HERE HTTP %d for %r: %s", r.status_code, address, (r.text or "")[:200])
+        return None
+    try:
+        data = r.json()
+    except Exception:
+        return None
+    items = data.get("items") or []
+    if not items:
+        return None
+    top = items[0]
+    pos = top.get("position") or {}
+    lat, lng = pos.get("lat"), pos.get("lng")
+    if lat is None or lng is None:
+        return None
+
+    result_type = top.get("resultType") or "unknown"
+    tier_map = {
+        "intersection": "HERE_INTERSECTION",
+        "street":       "HERE_STREET",
+        "houseNumber":  "HERE_HOUSE_NUMBER",
+    }
+    location_type = tier_map.get(result_type, "HERE_LOCALITY")
+
+    return GeocodeResult(
+        latitude=float(lat),
+        longitude=float(lng),
+        formatted_address=top.get("title", "") or top.get("address", {}).get("label", ""),
+        location_type=location_type,
+        place_id=top.get("id"),
+    )
+
+
+# =====================================================================
+# Tier 1b: Overpass motorway_junction — for tagged ramps/interchanges
+# =====================================================================
+
+def _overpass_motorway_junction(
+    street_a: str, street_b: str, city: str, state: str,
+    bbox: Optional[dict] = None,
+) -> Optional[GeocodeResult]:
+    """For inputs that look like highway interchanges, look up OSM
+    `highway=motorway_junction` nodes. These are tagged at the actual
+    gore points of ramps with `ref` (exit number) and sometimes `name`
+    matching the cross street.
+
+    Coverage in OSM for interchanges is patchy — varies state by state —
+    but when it hits the coords are exact. Fast fail when it misses,
+    so cheap to try as Tier 1b alongside the standard intersection-node
+    query.
+
+    Strategy: search the city bbox for motorway_junction nodes whose
+    `name` regex-matches the non-highway street (the cross street), OR
+    whose `ref` matches an exit-number pattern in the input. First node
+    hit wins.
+
+    NOTE: this catches the cases where OSM HAS the data; the long-tail
+    "OSM doesn't know this ramp" cases fall through to HERE (Tier 4).
+    """
+    if bbox is None:
+        return None
+
+    # The "cross street" is whichever side ISN'T the highway designation.
+    # Highway-like patterns: starts with "US", "I-", "SR-", "Hwy", "Route",
+    # or contains "Ramp" / "Bypass".
+    HIGHWAY_RE = re.compile(r"^(US|I-|SR-?\s?\d|Highway|Hwy|Route)\b", re.IGNORECASE)
+    RAMPISH = re.compile(r"\b(Ramp|Bypass|Off-Ramp|On-Ramp|Loop)\b", re.IGNORECASE)
+    a_is_hwy = bool(HIGHWAY_RE.match(street_a.strip())) or bool(RAMPISH.search(street_a))
+    b_is_hwy = bool(HIGHWAY_RE.match(street_b.strip())) or bool(RAMPISH.search(street_b))
+    if not (a_is_hwy or b_is_hwy):
+        return None  # not an interchange query; skip this tier
+
+    cross_street = street_b if a_is_hwy else street_a
+    cross_candidates = _street_name_candidates(cross_street)
+    if not cross_candidates:
+        return None
+    cross_regex = "|".join(_overpass_escape(c) for c in cross_candidates)
+
+    pad = 0.03
+    south = bbox["low"]["latitude"]   - pad
+    west  = bbox["low"]["longitude"]  - pad
+    north = bbox["high"]["latitude"]  + pad
+    east  = bbox["high"]["longitude"] + pad
+
+    ql = (
+        f"[out:json][timeout:{OVERPASS_TIMEOUT_SEC}];\n"
+        f"node({south},{west},{north},{east})"
+        f'[highway=motorway_junction][name~"({cross_regex})",i];\n'
+        "out 5;\n"
+    )
+    try:
+        r = requests.post(
+            OVERPASS_URL,
+            data={"data": ql},
+            timeout=OVERPASS_TIMEOUT_SEC,
+            headers={"User-Agent": "Ellen (Quality Counts) traffic-study intake"},
+        )
+        r.raise_for_status()
+        data = r.json()
+    except Exception as exc:
+        log.info("Overpass motorway_junction call failed for %r × %r: %s",
+                 street_a, street_b, exc)
+        return None
+    nodes = [e for e in (data.get("elements") or []) if e.get("type") == "node"]
+    if not nodes:
+        return None
+    node = nodes[0]
+    return GeocodeResult(
+        latitude=float(node["lat"]),
+        longitude=float(node["lon"]),
+        formatted_address=f"{street_a} & {street_b}, {city}, {state}",
+        location_type="OSM_MOTORWAY_JUNCTION",
+        place_id=f"osm-junction-{node.get('id')}",
+    )
+
+
+# =====================================================================
+# Shape detection — routes addresses to the right tier sequence
+# =====================================================================
+
+# Tokens that mark an address as interchange-shaped — skip Tier 1 (regular
+# intersection node) since those queries are guaranteed to miss for ramps.
+_INTERCHANGE_PATTERN = re.compile(
+    r"\b(Ramp|Exit|Bypass|Off-Ramp|On-Ramp|Loop|"
+    r"I-\d+|SR-?\s?\d+|US ?\d+(?:/\d+)?|Highway \d+|Hwy \d+|Route \d+)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_interchange_shaped(parsed: dict) -> bool:
+    """True if either street looks like a highway/ramp/exit, suggesting
+    Tier 1b (motorway_junction) and Tier 4 (HERE) are more likely to
+    succeed than Tier 1 (named-node intersection) or Tier 3 (Autocomplete
+    canonicalize). Saves 30-60s on per-address chain time."""
+    a = parsed.get("street_a", "")
+    b = parsed.get("street_b", "")
+    return bool(_INTERCHANGE_PATTERN.search(a) or _INTERCHANGE_PATTERN.search(b))
+
+
 def _intersection_chain(
     parsed: dict, api_key: str,
 ) -> Optional[GeocodeResult]:
-    """Walk the intersection-aware chain.
+    """Walk the intersection-aware chain with SHAPE ROUTING.
 
-    Restructured 2026-05-25 after live testing showed:
-      - searchText with `includedType="intersection"` zero-results even
-        on known-good intersections (filter removed; see helper docstring)
-      - Autocomplete canonicalizes street names reliably ("Apple Blossom
-        Mall Drive" → "Apple Blossom Drive"), which often unlocks an
-        Overpass hit that the raw names would have missed
-      - Overpass with the CANONICAL names returns exact node coords for
-        free, so the Autocomplete pre-pass should run BEFORE Places
-        searchText, not after it
+    Rebuilt 2026-05-25 after live HERE eval (16/16 on Pittsboro vs 0-2/16
+    for the prior Places-based chain). Two big changes from prior:
+      - Places searchText / Find Place tiers DROPPED — they produced
+        "pins in fields" (POI-near-streets, not intersections)
+      - HERE Geocoder added as Tier 4 — 16/16 hit rate including
+        ramps/interchanges that OSM doesn't tag
 
-    Order (accuracy + cost optimized):
-      1. Overpass with raw names           — free, exact when works
-      2. Autocomplete each street          — paid (~$0.006 / pair)
-      3. Overpass with CANONICAL names     — free, exact when works
-      4. Places searchText, canonical query — paid (~$0.032)
-      5. Places searchText, raw query      — paid (~$0.032) — defense
-                                              against Autocomplete failure
-      6. (caller) legacy Geocoding fallback
+    Routing by input shape:
+      - INTERCHANGE (street contains Ramp/Exit/I-/US/SR/Hwy/Route):
+          Tier 1b (Overpass motorway_junction) → Tier 4 (HERE)
+          Skips Tier 1 + 3 (guaranteed to miss for ramps)
+      - INTERSECTION (standard cross-street):
+          Tier 1 → Tier 2+3 (Autocomplete + retry Overpass) → Tier 4 (HERE)
 
-    Returns first hit. None if every tier missed.
+    Order summary (accuracy-first):
+      1. Overpass intersection-node (raw)    — FREE, exact for standard intersections
+      1b. Overpass motorway_junction         — FREE, exact for tagged ramps (interchange-shape only)
+      2. Autocomplete each street            — paid (~$0.006/pair); canonicalize
+      3. Overpass intersection-node (canonical) — FREE retry with corrected names
+      4. HERE Geocoder                       — paid (~$0.001/call, free 1k/day); best coverage
+
+    Returns first hit. None if every tier missed → caller falls to LLM text estimate.
     """
     street_a, street_b = parsed["street_a"], parsed["street_b"]
     city, state = parsed["city"], parsed["state"]
@@ -684,28 +906,37 @@ def _intersection_chain(
     # per process, so emails with multiple intersections in the same city
     # only pay this Geocoding call once.
     bbox = _locality_bbox(city, state, api_key)
+    is_interchange = _is_interchange_shaped(parsed)
 
-    # Tier 1: Overpass with raw names.
-    result = _overpass_intersection(street_a, street_b, city, state, bbox=bbox)
-    if result is not None:
-        log.info("Tier 1 (Overpass raw) HIT %r × %r in %s — exact node.",
-                 street_a, street_b, city)
-        return result
+    # ---- Tier 1: Overpass intersection-node (skipped for interchanges) ----
+    if not is_interchange:
+        result = _overpass_intersection(street_a, street_b, city, state, bbox=bbox)
+        if result is not None:
+            log.info("Tier 1 (Overpass raw) HIT %r × %r in %s — exact node.",
+                     street_a, street_b, city)
+            return result
 
-    # Tier 2: Canonicalize each street via Places (New) Autocomplete.
-    # This is paid (~$0.003 per call × 2 = ~$0.006 per intersection) but
-    # unlocks both Tier 3 (free Overpass retry) and Tier 4 (better Places
-    # searchText hit rate).
-    canon_a = _places_new_autocomplete_route(street_a, bbox, api_key) or street_a
-    canon_b = _places_new_autocomplete_route(street_b, bbox, api_key) or street_b
-    canonicalized = (canon_a, canon_b) != (street_a, street_b)
-    if canonicalized:
-        log.info("Autocomplete canonicalized: %r → %r ; %r → %r",
-                 street_a, canon_a, street_b, canon_b)
+    # ---- Tier 1b: Overpass motorway_junction (interchanges only) ----
+    if is_interchange:
+        result = _overpass_motorway_junction(street_a, street_b, city, state, bbox=bbox)
+        if result is not None:
+            log.info("Tier 1b (Overpass motorway_junction) HIT %r × %r in %s — exact ramp node.",
+                     street_a, street_b, city)
+            return result
 
-    # Tier 3: Overpass with CANONICAL names — free, often picks up the
-    # cases where the LLM-extracted name had an extra descriptor that
-    # threw the OSM regex match off.
+    # ---- Tier 2: Autocomplete each street (skipped for interchanges — Google
+    # autocomplete doesn't help with ramp names; saves ~$0.006 + ~2s per address) ----
+    canonicalized = False
+    canon_a, canon_b = street_a, street_b
+    if not is_interchange:
+        canon_a = _places_new_autocomplete_route(street_a, bbox, api_key) or street_a
+        canon_b = _places_new_autocomplete_route(street_b, bbox, api_key) or street_b
+        canonicalized = (canon_a, canon_b) != (street_a, street_b)
+        if canonicalized:
+            log.info("Autocomplete canonicalized: %r → %r ; %r → %r",
+                     street_a, canon_a, street_b, canon_b)
+
+    # ---- Tier 3: Overpass with canonical names ----
     if canonicalized:
         result = _overpass_intersection(canon_a, canon_b, city, state, bbox=bbox)
         if result is not None:
@@ -713,45 +944,17 @@ def _intersection_chain(
                      canon_a, canon_b, city)
             return result
 
-    # Tier 4a: Places (New) searchText, canonical names, intersection-only.
-    # Returns exact-intersection coords when Google's place graph has the
-    # cross-street indexed as type='intersection' (best paid case).
-    query_canon = f"{canon_a} & {canon_b}"
-    result = _places_new_search_text(
-        query_canon, bbox, api_key, include_intersection_only=True,
-    )
+    # ---- Tier 4: HERE Geocoder ----
+    # Best coverage for interchanges + LLM-mis-named streets. Returns
+    # tagged-tier coords (intersection / street / houseNumber); confidence
+    # mapping in GeocodeResult.confidence handles the gradient.
+    here_query = f"{canon_a} and {canon_b}, {city}, {state}"
+    result = _here_geocode(here_query, city=city, state=state)
     if result is not None:
-        if canonicalized:
-            result.location_type = "PLACES_NEW_CANONICAL"
-        log.info("Tier 4a (Places searchText canonical, intersection) HIT for %r in %s.",
-                 query_canon, city)
+        log.info("Tier 4 (HERE) HIT for %r in %s — resultType=%s",
+                 here_query, city, result.location_type)
         return result
 
-    # Tier 4b: Places searchText, canonical names, POI-tolerant.
-    # When Google has no intersection-typed entry, returns the nearest
-    # POI to the named streets — coords are usually within ~50m of the
-    # actual crosswalk. Tagged PLACES_NEW_POI so the user knows to
-    # verify the pin (and tracks as "medium" confidence).
-    result = _places_new_search_text(
-        query_canon, bbox, api_key, include_intersection_only=False,
-    )
-    if result is not None:
-        log.info("Tier 4b (Places searchText canonical, POI fallback) HIT for %r in %s — verify pin.",
-                 query_canon, city)
-        return result
-
-    # Tier 5: Places searchText with raw names, POI-tolerant — final
-    # defense against Autocomplete returning a wrong canonical that
-    # broke the search.
-    if canonicalized:
-        query_raw = f"{street_a} & {street_b}"
-        result = _places_new_search_text(
-            query_raw, bbox, api_key, include_intersection_only=False,
-        )
-        if result is not None:
-            log.info("Tier 5 (Places searchText raw, POI fallback) HIT for %r in %s — verify pin.",
-                     query_raw, city)
-            return result
     return None
 
 

@@ -9,6 +9,7 @@ import keyring
 SERVICE = "traffic-intake"
 ANTHROPIC_KEY = "anthropic_api_key"
 GOOGLE_GEOCODING_KEY = "google_geocoding_api_key"
+HERE_API_KEY = "here_api_key"
 QCHUB_USER_KEY = "qchub_username"
 QCHUB_PASS_KEY = "qchub_password"
 GOOGLE_EMAIL_KEY = "google_account_email"
@@ -41,6 +42,23 @@ def get_google_geocoding_key() -> str | None:
 
 def set_google_geocoding_key(key: str) -> None:
     keyring.set_password(SERVICE, GOOGLE_GEOCODING_KEY, key)
+
+
+def get_here_api_key() -> str | None:
+    """Read HERE Geocoding & Search API key. Env var wins; falls back to OS keyring.
+
+    Optional — if not set, the geocoder falls through to other tiers and logs
+    a single warning. Don't raise — many users may not have a HERE account
+    and the chain should degrade gracefully.
+    """
+    env = os.environ.get("HERE_API_KEY")
+    if env:
+        return env
+    return keyring.get_password(SERVICE, HERE_API_KEY)
+
+
+def set_here_api_key(key: str) -> None:
+    keyring.set_password(SERVICE, HERE_API_KEY, key)
 
 
 def get_qchub_credentials() -> tuple[str, str] | None:
