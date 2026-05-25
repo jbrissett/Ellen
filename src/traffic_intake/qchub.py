@@ -5551,7 +5551,12 @@ def auto_create_for_missing_entity(
     proceeds to create the new entry.
 
     Address resolution is a two-tier cascade (per user direction
-    2026-05-21):
+    2026-05-21) but only runs when we ACTUALLY need to create a new
+    company — per user direction 2026-05-25, the address isn't on the
+    User form, so a user-only add (company already exists in qchub)
+    skips this entirely. Saves a web-search call AND avoids cases
+    where a transient web-search APIConnectionError would kill the
+    user-create step too.
 
       TIER 1 — regex over email_body. Fast, deterministic, zero cost.
         Catches the common case of a clean 2-line signature with a
@@ -5602,49 +5607,62 @@ def auto_create_for_missing_entity(
         return False
 
     # ---- Phone (regex over email_body only — no LLM tier) ----
+    # Phone is needed for the User form regardless of whether we end
+    # up creating a company too; resolve it here once.
     phone = extract_first_phone(body) or _PHONE_SENTINEL
     if phone == _PHONE_SENTINEL:
         log(f"  No phone in signature — using sentinel {phone!r}")
     else:
         log(f"  Phone (from signature): {phone}")
 
-    # ---- Address — Tier 1: regex over email_body ----
-    address_1, city, state, zip_code = extract_address_from_signature(body)
-
-    # ---- Address — Tier 2: web_search if Tier 1 came up short ----
-    if not all((address_1, city, state, zip_code)):
-        log(
-            f"  Signature regex didn't yield a complete address "
-            f"(street={address_1!r}, city={city!r}, state={state!r}, "
-            f"zip={zip_code!r}) — trying web search for {name!r}."
-        )
-        w_street, w_city, w_state, w_zip = _llm_lookup_company_address(name, email, log)
-        # OR-fill: keep any partial fields the regex got, fill gaps from web.
-        address_1 = address_1 or w_street
-        city = city or w_city
-        state = state or w_state
-        zip_code = zip_code or w_zip
-
-    if not all((address_1, city, state, zip_code)):
-        log(
-            f"⚠ Couldn't resolve a complete address from signature regex OR "
-            f"web search (street={address_1!r}, city={city!r}, "
-            f"state={state!r}, zip={zip_code!r}). Auto-create aborting; "
-            f"the legacy 'missing entity' modal will fall through for "
-            f"manual entry."
-        )
-        return False
-    log(f"  Address resolved: {address_1}, {city}, {state} {zip_code}")
-
-    # --- COMPANY ---
+    # --- COMPANY: check first; only resolve address if we have to create ---
+    # IMPORTANT (per user direction 2026-05-25): the address resolution
+    # (regex + web-search) was previously running unconditionally — even
+    # when the company already existed in qchub and we only needed to
+    # add a user. The User form has NO address fields, so that work was
+    # wasted, and worse: a transient web-search APIConnectionError
+    # would bail the whole orchestrator and block the user create too.
+    # Observed run-20260525-092150 with Kimley-Horn / Kevin Dean.
+    #
+    # New order: check company existence FIRST. Only resolve the
+    # address if we'll actually create a new company.
     log(f"--- Company step: {name!r} ---")
     existing = read_existing_companies_via_admin(page, log)
     near = find_company_near_matches(name, existing, max_matches=5)
     exact = [m for m in near if m.score == 1.0]
     if exact:
         company_match = exact[0].option_text
-        log(f"  Company already exists as {company_match!r} — skipping create.")
+        log(f"  Company already exists as {company_match!r} — skipping create + address lookup.")
     else:
+        # Need to create a new company — NOW resolve the address.
+        log(
+            "  Company not in qchub — resolving address before create "
+            "(regex Tier 1, then web search Tier 2 if Tier 1 incomplete)."
+        )
+        address_1, city, state, zip_code = extract_address_from_signature(body)
+        if not all((address_1, city, state, zip_code)):
+            log(
+                f"  Signature regex didn't yield a complete address "
+                f"(street={address_1!r}, city={city!r}, state={state!r}, "
+                f"zip={zip_code!r}) — trying web search for {name!r}."
+            )
+            w_street, w_city, w_state, w_zip = _llm_lookup_company_address(name, email, log)
+            # OR-fill: keep any partial fields the regex got, fill gaps from web.
+            address_1 = address_1 or w_street
+            city = city or w_city
+            state = state or w_state
+            zip_code = zip_code or w_zip
+        if not all((address_1, city, state, zip_code)):
+            log(
+                f"⚠ Couldn't resolve a complete address from signature regex OR "
+                f"web search (street={address_1!r}, city={city!r}, "
+                f"state={state!r}, zip={zip_code!r}). Auto-create aborting; "
+                f"the legacy 'missing entity' modal will fall through for "
+                f"manual entry."
+            )
+            return False
+        log(f"  Address resolved: {address_1}, {city}, {state} {zip_code}")
+
         # Silent-create. Log near-matches loudly so dupes are visible.
         if near:
             log(
