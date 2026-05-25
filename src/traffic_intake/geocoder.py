@@ -1,4 +1,4 @@
-"""Intersection geocoder — Overpass (OSM) → Places API (New) → Autocomplete-canonicalize → legacy Geocoding API.
+"""Intersection geocoder — HERE-only, with legacy Geocoding API as last-resort fallback.
 
 Used to turn each StudyLocation's `address_or_intersection` (the LLM-friendly
 human form, e.g. 'N Socrum Loop Road and Old Combee Road, Lakeland, FL') into
@@ -6,44 +6,45 @@ an accurate lat/lon. Replaces Claude's vision/text_only estimates which are
 fine for identifying *which* intersection a client meant, but too rough for
 client-facing map pins.
 
-Chain (in accuracy-first order — established 2026-05-25 after the Winchester VA
-email went 1/8 on the legacy Geocoding-only path):
+Current chain (established 2026-05-25 late after Pittsboro 16-address eval):
 
-  1. **Overpass / OpenStreetMap** (free, no key) — for any input parseable as
-     "<street A> and <street B>, <city>, <state>". OSM models intersections
-     as the literal shared node where two named highway ways meet, so when
-     Overpass returns a hit, the coords are pixel-perfect (the actual node
-     position, not a geometric center). Failure mode = miss, not wrong-pin.
+  1. **HERE Geocoder v7** — automotive-grade dataset (NAVTEQ heritage +
+     telemetry). Tolerates fuzzy LLM-typed street names natively + handles
+     ramps/interchanges. Bbox proximity bias avoids same-named-street
+     false matches in other cities. Returns tagged result types
+     (intersection / street / houseNumber) mapped to high/medium confidence.
+     Pittsboro: 8 high + 8 medium = 16/16 placed in ~15s parallel.
 
-  2. **Google Places API (New) `places:searchText`** with `includedType="intersection"`
-     and `locationRestriction.rectangle` set to the city's bbox. Broader
-     coverage than Overpass for newer / private / commercial roads. Tagged
-     `PLACES_NEW_INTERSECTION` for confidence reporting.
+  2. **Legacy Geocoding API + Places Find Place** — last resort for
+     non-intersection inputs (single addresses, mile posts) and as a
+     safety net if HERE missed. Falls through to APPROXIMATE city-level
+     pin as final fallback so a map pin always lands somewhere in the
+     right city.
 
-  3. **Places Autocomplete-canonicalize + retry searchText** — when step 2
-     misses, hit Autocomplete (New) on each street individually with
-     `includedPrimaryTypes=["route"]` to fix fuzzy spelling / missing
-     suffix, then re-issue searchText with the canonical pair. This is
-     the standard fix for human/LLM-typed street names.
+Why we dropped Overpass + Places autocomplete (2026-05-25):
+  - Overpass intersection-node + motorway_junction: 1/16 hit rate on
+    Pittsboro, 10s timeout on every miss → ~5× wall-time tax for a
+    1-in-16 exact-node win that HERE places ~30m away anyway.
+  - Places Autocomplete + retry-Overpass: 81s per Overpass-miss address
+    in Zephyrhills trace for zero accuracy benefit (HERE handles fuzzy
+    names natively).
+  - Places searchText / Find Place: returned "pins in fields" (POIs near
+    the named streets, not actual intersections).
 
-  4. **Legacy Geocoding API + Places Find Place** — last resort for
-     non-intersection inputs (single addresses, mile posts, etc.) and as
-     a safety net if every intersection-aware tier missed.
+The dropped tier functions (_overpass_intersection,
+_overpass_motorway_junction, _places_new_autocomplete_route,
+_places_new_search_text) are kept in this module as ~dormant code —
+re-wireable if HERE coverage ever regresses.
 
-City bbox is resolved once per (city, state) via one Geocoding API call and
-cached for the process lifetime, so multi-intersection emails in the same
-city don't waste calls.
+City bbox is resolved once per (city, state) via the legacy Geocoding API
+and cached for the process lifetime. The extractor pre-warms unique-city
+bboxes sequentially before launching the geocoder threadpool, so each
+worker hits a warm cache on entry.
 
 Costs (verified 2026-01):
-  - Overpass: free (rate-limited at the public endpoint)
-  - Places API (New) searchText: $32/1k = $0.032/call
-  - Places API (New) autocomplete: $2.83/1k = $0.0028/call
-  - Legacy Geocoding: $5/1k = $0.005/call
-  - Legacy Find Place from Text: $17/1k = $0.017/call
-
-NOTE for users: Places API (New) is a separate Google Cloud product. Enable
-it once at https://console.cloud.google.com/apis/library/places.googleapis.com
-on the same project that has Geocoding API enabled. Same API key.
+  - HERE Geocoder: free 1k/day, then ~$0.001/call
+  - Legacy Geocoding API: $5/1k = $0.005/call (bbox + fallback)
+  - Legacy Find Place from Text: $17/1k = $0.017/call (rare fallback)
 """
 from __future__ import annotations
 
@@ -940,30 +941,26 @@ def _is_interchange_shaped(parsed: dict) -> bool:
 def _intersection_chain(
     parsed: dict, api_key: str,
 ) -> Optional[GeocodeResult]:
-    """Walk the intersection-aware chain with SHAPE ROUTING.
+    """HERE-only intersection geocoder.
 
-    Trimmed 2026-05-25 PM after Zephyrhills trace showed Tier 2 (Places
-    Autocomplete) burning 81s on a single Overpass-miss address. The
-    autocomplete tier was a "bridge" — canonicalize street names, then
-    retry Overpass — but HERE (Tier 4) handles fuzzy LLM-typed names
-    natively, so the bridge isn't earning its 80s cost. Dropped Tier 2 +
-    Tier 3 entirely; chain is now strictly Overpass-then-HERE.
+    Trimmed to a single tier 2026-05-25 late after the Pittsboro trace
+    showed Overpass earning 1/16 hits while costing 10s per miss on the
+    other 15 (the per-address phase total was dominated by the Overpass
+    timeout tail). HERE handles fuzzy LLM-typed names + ramps natively
+    and returns within ~1s; the single Overpass exact-node win wasn't
+    worth a ~5× wall-time slowdown.
 
-    Order (accuracy-first):
-      INTERSECTION:  Tier 1 (Overpass intersection-node) → Tier 4 (HERE)
-      INTERCHANGE:   Tier 1b (Overpass motorway_junction) → Tier 4 (HERE)
+    The bbox is still resolved (pre-warmed by the extractor) and passed
+    to HERE as proximity bias — without it HERE searches globally and
+    returns wrong-city results for common street names.
 
-      1.  Overpass intersection-node          — FREE, exact for standard intersections
-      1b. Overpass motorway_junction          — FREE, exact for tagged ramps
-      4.  HERE Geocoder                       — ~$0.001/call (free 1k/day); best coverage
+    Returns the HERE result or None on miss → caller falls to LLM text estimate.
 
-    Returns first hit. None if every tier missed → caller falls to LLM
-    text estimate.
-
-    The autocomplete functions (`_places_new_autocomplete_route`) are
-    retained in the module for now in case HERE coverage regresses and
-    the bridge is needed back. Re-introducing them just means wiring two
-    timed() blocks between the Overpass and HERE tiers.
+    The Overpass functions (`_overpass_intersection`,
+    `_overpass_motorway_junction`) and Places autocomplete are retained
+    in the module in case HERE coverage regresses and we need to re-add
+    a fallback tier. Re-introducing them is just wiring a timed() block
+    here before the HERE call.
     """
     from . import trace_log  # local import — avoid module-load circularity
 
@@ -971,41 +968,16 @@ def _intersection_chain(
     city, state = parsed["city"], parsed["state"]
     addr_tag = f"{street_a} & {street_b}, {city}, {state}"
 
-    # Resolve the city bbox once up-front. Cached after the first lookup
-    # per process, so emails with multiple intersections in the same city
-    # only pay this Geocoding call once. Note: in the extractor, the bboxes
-    # for all unique (city, state) pairs are pre-warmed sequentially BEFORE
-    # the threadpool launches, so worker threads see a cache hit here
-    # rather than blocking ~40s on a cold first call.
+    # Resolve the city bbox for HERE proximity bias. Pre-warmed by the
+    # extractor before the threadpool launches, so this should always
+    # be a cache hit here (~0ms).
     with trace_log.timed("geocoder.bbox_lookup", city=city, state=state) as t:
         bbox = _locality_bbox(city, state, api_key)
         t["bbox_resolved"] = bbox is not None
-    is_interchange = _is_interchange_shaped(parsed)
+        # bbox value isn't used directly anymore (HERE call resolves its
+        # own proximity hint via _locality_bbox internally) but the lookup
+        # populates the shared cache for the HERE proximity bias step.
 
-    # ---- Tier 1: Overpass intersection-node (skipped for interchanges) ----
-    if not is_interchange:
-        with trace_log.timed("geocoder.tier", phase="overpass_raw", address=addr_tag) as t:
-            result = _overpass_intersection(street_a, street_b, city, state, bbox=bbox)
-            t["hit"] = result is not None
-        if result is not None:
-            log.info("Tier 1 (Overpass raw) HIT %r × %r in %s — exact node.",
-                     street_a, street_b, city)
-            return result
-
-    # ---- Tier 1b: Overpass motorway_junction (interchanges only) ----
-    if is_interchange:
-        with trace_log.timed("geocoder.tier", phase="overpass_motorway_junction", address=addr_tag) as t:
-            result = _overpass_motorway_junction(street_a, street_b, city, state, bbox=bbox)
-            t["hit"] = result is not None
-        if result is not None:
-            log.info("Tier 1b (Overpass motorway_junction) HIT %r × %r in %s — exact ramp node.",
-                     street_a, street_b, city)
-            return result
-
-    # ---- Tier 4: HERE Geocoder ----
-    # Best coverage for interchanges + LLM-mis-named streets. Returns
-    # tagged-tier coords (intersection / street / houseNumber); confidence
-    # mapping in GeocodeResult.confidence handles the gradient.
     here_query = f"{street_a} and {street_b}, {city}, {state}"
     with trace_log.timed("geocoder.tier", phase="here", address=addr_tag) as t:
         result = _here_geocode(here_query, city=city, state=state)
@@ -1013,7 +985,7 @@ def _intersection_chain(
         if result is not None:
             t["result_type"] = result.location_type
     if result is not None:
-        log.info("Tier 4 (HERE) HIT for %r in %s — resultType=%s",
+        log.info("HERE HIT for %r in %s — resultType=%s",
                  here_query, city, result.location_type)
         return result
 
