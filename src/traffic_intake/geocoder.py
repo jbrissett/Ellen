@@ -129,8 +129,16 @@ class GeocodeResult:
 
 # Module-level cache for (city, state) → bbox lookups. One Geocoding call
 # per unique city per process lifetime. Thread-safe via the lock.
+#
+# Per-key in-flight locks deduplicate concurrent FIRST-misses: without
+# them, two parallel workers can both check the cache (empty), both make
+# the same ~40s Google call, both wait, both write the same result.
+# Observed trace 2026-05-25: Zephyrhills FL had 2× 40.7s bbox_lookup
+# events fired simultaneously by two workers. Now the second worker
+# blocks on the first worker's lock until the bbox is cached.
 _bbox_cache: dict[tuple[str, str], Optional[dict]] = {}
-_bbox_cache_lock = threading.Lock()
+_bbox_cache_lock = threading.Lock()  # guards cache reads/writes
+_bbox_inflight_locks: dict[tuple[str, str], threading.Lock] = {}  # per-key fetch locks
 
 
 class GeocoderUnavailable(Exception):
@@ -275,22 +283,52 @@ def _locality_bbox(city: str, state: str, api_key: str) -> Optional[dict]:
     """Return the city's bounding box for use as Places `locationRestriction`.
 
     Issues exactly ONE Geocoding API call per unique (city, state) per
-    process lifetime; subsequent lookups hit the in-memory cache. Returns
-    a dict like {"low": {"latitude": .., "longitude": ..},
-    "high": {"latitude": .., "longitude": ..}} or None if the city
+    process lifetime; subsequent lookups (including concurrent ones from
+    parallel geocoder workers) block on a per-key in-flight lock until
+    the first thread populates the cache. Returns a dict like
+    {"low": {"latitude": .., "longitude": ..},
+     "high": {"latitude": .., "longitude": ..}} or None if the city
     couldn't be resolved.
     """
     key = (city.strip().lower(), state.strip().upper())
+    # Fast path: already cached
     with _bbox_cache_lock:
         if key in _bbox_cache:
             return _bbox_cache[key]
+        # Get or create the per-key in-flight lock atomically under the
+        # main cache lock to avoid two threads creating different locks.
+        fetch_lock = _bbox_inflight_locks.setdefault(key, threading.Lock())
+
+    # Per-key lock dedupes concurrent first-misses. The second arriving
+    # thread blocks here until the first one finishes its fetch + write.
+    with fetch_lock:
+        with _bbox_cache_lock:
+            if key in _bbox_cache:
+                # First thread already populated while we were waiting.
+                return _bbox_cache[key]
+        # We're the first (or sole) thread to fetch. Do the API call,
+        # write the result, return.
+        return _locality_bbox_fetch(key, city, state, api_key)
+
+
+def _locality_bbox_fetch(
+    key: tuple[str, str], city: str, state: str, api_key: str,
+) -> Optional[dict]:
+    """Inner fetch — caller holds the per-key in-flight lock."""
     params = {
         "address": f"{city}, {state}",
         "components": f"country:US|administrative_area:{state}",
         "key": api_key,
     }
     try:
-        r = requests.get(GEOCODE_URL, params=params, timeout=REQUEST_TIMEOUT_SEC)
+        # (connect, read) tuple — without this, the single-value timeout
+        # bounds CONNECT time only, leaving read time effectively unbounded.
+        # That's how a hung Google call cost us 80+ seconds on a single
+        # autocomplete request (observed Zephyrhills trace 2026-05-25).
+        r = requests.get(
+            GEOCODE_URL, params=params,
+            timeout=(REQUEST_TIMEOUT_SEC, REQUEST_TIMEOUT_SEC),
+        )
         r.raise_for_status()
     except requests.RequestException as exc:
         log.info("Locality bbox lookup failed for %r, %r: %s", city, state, exc)

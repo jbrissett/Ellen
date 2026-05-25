@@ -671,7 +671,11 @@ def _refine_estimates_via_geocoding(request: StudyRequest) -> None:
             # having successfully resolved them. Observed run-20260525-162802
             # (Pittsboro on coverage-here-tier): 5/16 addresses fell to
             # text_only despite HERE having the data, due to this race.
-            DRAIN_BUDGET = REQUEST_TIMEOUT_SEC + 5  # max single-call timeout + buffer
+            # max per-call timeout + buffer. Reference geocoder.REQUEST_TIMEOUT_SEC
+            # explicitly — earlier ship had this as a bare REQUEST_TIMEOUT_SEC
+            # which raised NameError at runtime (extractor.py has no such name),
+            # crashing the geocoder phase and the user saw "extraction timed out".
+            DRAIN_BUDGET = geocoder.REQUEST_TIMEOUT_SEC + 5
             remaining = [f for f in futures if f not in processed]
             log.warning(
                 "Geocoder phase hit %ds budget — draining %d in-flight worker(s) "
