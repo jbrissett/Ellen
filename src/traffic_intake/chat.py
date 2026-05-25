@@ -1082,6 +1082,39 @@ def _summarize_kmz_attachment(att) -> str:
     return "\n".join(lines)
 
 
+def _auto_recapture(qchub_edit_session) -> dict:
+    """Chain a re_capture after an estimate edit so the saved PDF is
+    always in sync with the latest edit. Returns the re_capture result
+    (version + pdf_path + ...) or an error dict if the recapture
+    failed — the EDIT itself already succeeded by the time this runs,
+    so we never raise.
+
+    Why this exists (user direction 2026-05-25): after Ellen made an
+    edit she'd often stop and let the user open Estimate_NNNNN.pdf —
+    which was the stale pre-edit version because re_capture is a
+    separate tool call she didn't always make. Auto-chaining here
+    means every edit call atomically refreshes the PDF.
+
+    Slow-path: each re_capture adds ~10-15s (PDF download + write).
+    For bulk edits via apply_rate_to_all_matching that's still ONE
+    re-capture (one tool call from Ellen). For sequences of
+    per-row edits the user incurs N re-captures, which is suboptimal
+    but always-correct. Optimize later if it becomes a UX problem.
+    """
+    try:
+        return qchub_edit_session.re_capture()
+    except Exception as exc:
+        return {
+            "error": (
+                f"Edit applied but auto-recapture failed: "
+                f"{type(exc).__name__}: {exc}. "
+                f"The edit IS live in the qchub modal; the saved PDF "
+                f"is the pre-edit version. User can call "
+                f"re_capture_estimate explicitly to refresh."
+            ),
+        }
+
+
 def _scrub_dollars_from_estimate_result(result):
     """Replace dollar amounts in an estimate-tool result with sentinels
     so Ellen literally cannot read (and therefore cannot misquote) them.
@@ -1201,24 +1234,45 @@ def execute_tool(
                 if name == "list_estimate_subtype_options":
                     result = qchub_edit_session.list_subtype_options(int(args["line_index"]))
                     return json.dumps(_scrub_dollars_from_estimate_result(result), indent=2)
+                # The three edit tools (set_estimate_subtype,
+                # set_estimate_rate, apply_estimate_rate_to_all_matching)
+                # automatically chain a re_capture so the PDF in
+                # Downloads is always fresh after Ellen makes a change.
+                # Without this, Ellen routinely "applies $400 to all
+                # rows" and then stops — leaving a stale PDF the user
+                # opens expecting updated numbers (observed
+                # run-20260524-232317).
                 if name == "set_estimate_subtype":
-                    result = qchub_edit_session.set_subtype(int(args["line_index"]), str(args["subtype"]))
-                    return json.dumps(_scrub_dollars_from_estimate_result(result), indent=2)
+                    edit = qchub_edit_session.set_subtype(int(args["line_index"]), str(args["subtype"]))
+                    recap = _auto_recapture(qchub_edit_session)
+                    return json.dumps(_scrub_dollars_from_estimate_result(
+                        {"edit": edit, "recapture": recap}
+                    ), indent=2)
                 if name == "set_estimate_rate":
-                    result = qchub_edit_session.set_rate(
+                    edit = qchub_edit_session.set_rate(
                         int(args["line_index"]),
                         float(args["unit_price"]),
                         extra_rate=float(args.get("extra_rate", 0.0)),
                     )
-                    return json.dumps(_scrub_dollars_from_estimate_result(result), indent=2)
+                    recap = _auto_recapture(qchub_edit_session)
+                    return json.dumps(_scrub_dollars_from_estimate_result(
+                        {"edit": edit, "recapture": recap}
+                    ), indent=2)
                 if name == "apply_estimate_rate_to_all_matching":
-                    result = qchub_edit_session.apply_rate_to_all_matching(
+                    edit = qchub_edit_session.apply_rate_to_all_matching(
                         str(args["subtype_contains"]),
                         float(args["unit_price"]),
                         extra_rate=float(args.get("extra_rate", 0.0)),
                     )
-                    return json.dumps(_scrub_dollars_from_estimate_result(result), indent=2)
+                    recap = _auto_recapture(qchub_edit_session)
+                    return json.dumps(_scrub_dollars_from_estimate_result(
+                        {"edit": edit, "recapture": recap}
+                    ), indent=2)
                 if name == "re_capture_estimate":
+                    # Direct re-capture still available for Ellen to
+                    # explicitly trigger (e.g., after the user manually
+                    # poked at the modal in visible mode). Edits chain
+                    # this automatically — manual call is rarely needed.
                     result = qchub_edit_session.re_capture()
                     return json.dumps(_scrub_dollars_from_estimate_result(result), indent=2)
             except Exception as exc:
