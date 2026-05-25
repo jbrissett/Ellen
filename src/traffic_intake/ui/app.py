@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QSplitter,
     QStatusBar,
     QSystemTrayIcon,
@@ -220,7 +221,15 @@ class MainWindow(QMainWindow):
           - clamp to a usable minimum (800x600) so the panels don't get cramped
           - cap at 1500x900 on very large displays so we don't open huge
           - center on the same screen
+
+        Also pins `setMinimumSize(800, 600)` so child widgets coming and
+        going visible cannot raise the implicit window minimum and force
+        Qt to grow the window. Per user direction 2026-05-25: window sizing
+        is a USER concern; Ellen must never reshape herself.
         """
+        # Absolute floor — applies whether or not we have a screen. Stops
+        # the splitter's child minimums from leaking up to the window.
+        self.setMinimumSize(800, 600)
         screen = QApplication.primaryScreen()
         if screen is None:
             # Headless / no display — fall back to a sane default and bail.
@@ -234,6 +243,24 @@ class MainWindow(QMainWindow):
         frame.moveCenter(avail.center())
         self.move(frame.topLeft())
 
+    def sizeHint(self):
+        """Override Qt's default sizeHint so child visibility changes cannot
+        trigger an `adjustSize()` that reshapes the window.
+
+        Default behavior: QMainWindow.sizeHint() asks the central widget for
+        its preferred size; when a child becomes visible the preferred size
+        grows; Qt's layout system then nudges the window to match. The user
+        sees that as "Ellen shape-shifts depending on what state she's in."
+
+        Override: before the first show(), return Qt's natural hint so the
+        startup geometry is correct; after that, return the current size so
+        adjustSize() is a no-op. The user can still drag the window edges —
+        that path doesn't go through sizeHint().
+        """
+        if not self.isVisible():
+            return super().sizeHint()
+        return self.size()
+
     def _build_central(self) -> None:
         # Left pane: drop zone + extraction panel + actions (existing UI)
         left = QWidget()
@@ -245,13 +272,19 @@ class MainWindow(QMainWindow):
         self.drop_zone.diagnosticMessage.connect(self.status)
         left_layout.addWidget(self.drop_zone, 1)
 
+        # Extraction panel and action row are ALWAYS visible. Their empty
+        # states (extraction_panel shows an italic "Drop an email above"
+        # placeholder; action_row shows three disabled buttons) carry zero
+        # confusion. Previously these were `setVisible(False)` at startup
+        # and toggled True on extraction-finished — but that toggle made
+        # the layout's preferred size jump, which made Qt reshape the
+        # window. Per user direction 2026-05-25: window sizing is a USER
+        # action only.
         self.extraction_panel = ExtractionPanel()
         left_layout.addWidget(self.extraction_panel, 2)
-        self.extraction_panel.setVisible(False)
 
         self.action_row = self._build_action_row()
         left_layout.addWidget(self.action_row)
-        self.action_row.setVisible(False)
 
         # Right pane: chat sidebar (persistent — always visible)
         self.chat_panel = ChatPanel()
@@ -263,6 +296,13 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
         splitter.setSizes([900, 600])
+
+        # Belt-and-suspenders: tell the splitter "don't push your sizeHint
+        # up to the window." Combined with sizeHint() override above, this
+        # makes child visibility / content changes inert at the window level.
+        # `Ignored` is right here — the splitter still fills whatever space
+        # the window gives it, but never asks for more.
+        splitter.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
 
         self.setCentralWidget(splitter)
 
@@ -372,9 +412,9 @@ class MainWindow(QMainWindow):
 
     def on_new(self) -> None:
         """Clear the loaded extraction and reset to drop-zone state."""
+        # extraction_panel and action_row stay visible — only their content
+        # resets. See _build_central for why we no longer toggle visibility.
         self.extraction_panel.setRequest(None)
-        self.extraction_panel.setVisible(False)
-        self.action_row.setVisible(False)
         self.drop_zone.setBusy(False)
         for b in (self.btn_map, self.btn_qchub, self.btn_email):
             b.setEnabled(False)
@@ -993,9 +1033,11 @@ class MainWindow(QMainWindow):
 
     def _on_extraction_finished(self, request: StudyRequest) -> None:
         self.drop_zone.setBusy(False)
+        # No visibility toggle — both panels stay visible at all times.
+        # setRequest swaps the extraction panel's inner state from
+        # "empty placeholder" to "tabs with data"; the action row just
+        # enables its buttons below.
         self.extraction_panel.setRequest(request)
-        self.extraction_panel.setVisible(True)
-        self.action_row.setVisible(True)
         n = request.total_locations
         self.status(f"Extracted {n} location{'s' if n != 1 else ''} from {request.email_subject!r}.")
         for b in (self.btn_map, self.btn_qchub, self.btn_email):
