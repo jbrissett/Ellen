@@ -166,8 +166,23 @@ class MainWindow(QMainWindow):
         # Urgent failures always toast — even if the window is active —
         # so the user notices red-flag conditions. Non-urgent toasts
         # only fire when the user isn't already watching the window.
-        if not always and not urgent and self.isActiveWindow():
-            return
+        # Use QApplication.applicationState() not self.isActiveWindow()
+        # — `isActiveWindow` reports True even when the OS foreground
+        # focus has moved to another app (Qt's "active window" is per-
+        # process, not per-OS-foreground). User feedback 2026-05-26:
+        # backgrounded the app, no toast fired on extraction-finished.
+        # applicationState() returns ApplicationActive only when the
+        # user's OS focus is genuinely on our app.
+        if not always and not urgent:
+            from PySide6.QtCore import QCoreApplication, Qt
+            app_inst = QCoreApplication.instance()
+            user_focused_on_app = (
+                app_inst is not None
+                and app_inst.applicationState() == Qt.ApplicationState.ApplicationActive
+                and not self.isMinimized()
+            )
+            if user_focused_on_app:
+                return
         icon_kind = (
             QSystemTrayIcon.MessageIcon.Critical
             if urgent
