@@ -721,16 +721,16 @@ TOOLS = [
             "Count' vs 'Class, Volume -- 4+ Lanes'). The available options "
             "depend on the GROUP this row belongs to: Tube > Volume groups have "
             "different options than Tube > Volume,Class groups. Returns "
-            "{line_index, current, options: [str, ...]}. Note: Survey-group rows "
+            "{line_number, current, options: [str, ...]}. Note: Survey-group rows "
             "have NO subtype dropdown (only price is editable) — calling this "
             "on a survey row returns an empty options list."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "line_index": {"type": "integer", "description": "0-based row index from get_estimate_lines"},
+                "line_number": {"type": "integer", "description": "1-based row number as shown in qchub's UI (Line 1, Line 2, ...). Pass the user's number verbatim — no subtraction needed."},
             },
-            "required": ["line_index"],
+            "required": ["line_number"],
             "additionalProperties": False,
         },
     },
@@ -747,10 +747,10 @@ TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "line_index": {"type": "integer", "description": "0-based row index from get_estimate_lines"},
+                "line_number": {"type": "integer", "description": "1-based row number as shown in qchub's UI (Line 1, Line 2, ...). Pass the user's number verbatim — no subtraction needed."},
                 "subtype": {"type": "string", "description": "Substring of the qchub option text"},
             },
-            "required": ["line_index", "subtype"],
+            "required": ["line_number", "subtype"],
             "additionalProperties": False,
         },
     },
@@ -770,14 +770,95 @@ TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "line_index": {"type": "integer", "description": "0-based row index from get_estimate_lines"},
+                "line_number": {"type": "integer", "description": "1-based row number as shown in qchub's UI (Line 1, Line 2, ...). Pass the user's number verbatim — no subtraction needed."},
                 "unit_price": {"type": "number", "description": "Base study amount (Field 1)"},
                 "extra_rate": {
                     "type": "number",
                     "description": "Per-additional-unit rate (Field 2). Defaults to 0 when omitted — leave omitted for the common 'fixed amount per row' case.",
                 },
             },
-            "required": ["line_index", "unit_price"],
+            "required": ["line_number", "unit_price"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "apply_rate_to_location",
+        "description": (
+            "Drive qchub's native per-location cog wheel to set rates on ALL "
+            "rows of ONE location in a single click. Best for multi-period "
+            "sites (one location with N time windows — e.g., AM peak + PM "
+            "peak at the same intersection). Equivalent to clicking the cog "
+            "on that location's first row and picking 'Apply rate to Location'. "
+            "Pass ANY line_number that belongs to the target location; "
+            "qchub normalizes to the cog-bearing first row internally. "
+            "STRICTLY prefer this over multiple set_estimate_rate calls "
+            "when the target rows share a location."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "line_number": {"type": "integer", "description": "1-based row number of any row in the target location."},
+                "unit_price": {"type": "number", "description": "Base study amount (Field 1) to set + propagate."},
+                "extra_rate": {
+                    "type": "number",
+                    "description": "Per-additional-unit rate (Field 2). Defaults to 0 when omitted.",
+                },
+            },
+            "required": ["line_number", "unit_price"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "apply_rate_to_all_locations",
+        "description": (
+            "Drive qchub's native cog wheel to fan a single rate across "
+            "EVERY location in the row's group, in one server-side action. "
+            "Equivalent to clicking a row's cog and picking 'Apply location "
+            "rates to all'. Best for 'every TMC in this group is $400 flat' "
+            "style requests. Pass any line_number — qchub uses the rate you "
+            "supply, not the row's current rate, and propagates from that "
+            "location's cog-bearing row to all locations in the group. "
+            "STRICTLY prefer this over multiple set_estimate_rate calls "
+            "when the target rows span multiple locations within ONE group."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "line_number": {"type": "integer", "description": "1-based row number of any row in the target group."},
+                "unit_price": {"type": "number", "description": "Base study amount (Field 1) to set + propagate."},
+                "extra_rate": {
+                    "type": "number",
+                    "description": "Per-additional-unit rate (Field 2). Defaults to 0 when omitted.",
+                },
+            },
+            "required": ["line_number", "unit_price"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "apply_rate_to_rest_of_group",
+        "description": (
+            "Drive qchub's native cog wheel to fan a rate across all "
+            "OTHER locations in the group (EXCLUDING the location the "
+            "line_number belongs to). Equivalent to clicking a row's cog "
+            "and picking 'Apply location rates to rest'. Useful when one "
+            "site has special pricing already set and you want the rest "
+            "of the group at a different rate. Pattern: set the special "
+            "site's rate first via set_estimate_rate or apply_rate_to_location, "
+            "then call this with a line from THAT special location to "
+            "blast all other locations to the standard rate."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "line_number": {"type": "integer", "description": "1-based row number of any row in the location to EXCLUDE from propagation."},
+                "unit_price": {"type": "number", "description": "Base study amount (Field 1) for the OTHER locations."},
+                "extra_rate": {
+                    "type": "number",
+                    "description": "Per-additional-unit rate (Field 2). Defaults to 0 when omitted.",
+                },
+            },
+            "required": ["line_number", "unit_price"],
             "additionalProperties": False,
         },
     },
@@ -966,7 +1047,7 @@ Action-trigger rules:
    - Tube > Volume, Speed > similar lane-count variants
    - TMC > group rows: `Standard`, `Large`, `Complex`, `w/Demand`, `Bikes Only`, `Ins & Outs`, etc.
    - **Survey rows have NO subtype dropdown** — only price is editable. Don't try `set_estimate_subtype` on a survey row.
-- BEFORE picking an estimate-modal subtype, ALWAYS call `list_estimate_subtype_options(line_index)` to read the LIVE options for that row's group. The available options depend on the group; guessing leads to silent no-ops. Pattern: get_estimate_lines → identify the rows you want → list_estimate_subtype_options on one of them → pick the exact option text → set_estimate_subtype on all matching rows.
+- BEFORE picking an estimate-modal subtype, ALWAYS call `list_estimate_subtype_options(line_number=N)` to read the LIVE options for that row's group. The available options depend on the group; guessing leads to silent no-ops. Pattern: get_estimate_lines → identify the rows you want → list_estimate_subtype_options on one of them → pick the exact option text → set_estimate_subtype on all matching rows.
 
 **Mapping user vocabulary to subtype layer:**
 - "ATR video volume" / "video ATR" → GROUP-level Tube subtype (`Video ATR - Volume`). Set on the StudyLocation's tube_subtype BEFORE create_qchub_order. NOT an estimate-modal value.
@@ -974,14 +1055,27 @@ Action-trigger rules:
 - "queue study", "gap study", "delay study", "custom video survey" → GROUP-level Survey subtype. Set on the StudyLocation's survey_subtype BEFORE create_qchub_order.
 
 **Live Estimate editing (after qchub order is created)**:
-After a qchub order is submitted, the qchub browser stays open and you have six tools that directly drive the live Estimate modal: `get_estimate_lines`, `list_estimate_subtype_options`, `set_estimate_subtype`, `set_estimate_rate`, `apply_estimate_rate_to_all_matching`, `re_capture_estimate`. Use these when the user wants to amend subtypes or negotiate rates ("the TMCs are $400 each, not standard rate"; "change line 2 to volume+class"). Workflow:
+After a qchub order is submitted, the qchub browser stays open and you have these tools driving the live Estimate modal: `get_estimate_lines`, `list_estimate_subtype_options`, `set_estimate_subtype`, `set_estimate_rate`, `apply_rate_to_location`, `apply_rate_to_all_locations`, `apply_rate_to_rest_of_group`, `apply_estimate_rate_to_all_matching`, `re_capture_estimate`.
+
+**RATE-EDIT TOOL SELECTION — use the cog tools, not per-row set, whenever the request affects 2+ rows.** qchub's Estimate modal has a per-LOCATION cog wheel (one per location, anchored to that location's first time-window row) with three native bulk-apply options. Match the user's intent to the right cog tool BEFORE falling back to row-by-row:
+
+| User says... | Use |
+|---|---|
+| "set rates on this site at $X" (the site has multiple time windows) | `apply_rate_to_location(line_number=any row of that site, unit_price=X)` |
+| "$X across the board" / "$X for every TMC in this group" / "all locations $X" | `apply_rate_to_all_locations(line_number=any row in the group, unit_price=X)` |
+| "$X for everywhere EXCEPT this site" (you've already priced one site differently) | `apply_rate_to_rest_of_group(line_number=any row of the EXCLUDED site, unit_price=X)` |
+| "change just line 7 to $X" (single isolated row) | `set_estimate_rate(line_number=7, unit_price=X)` |
+
+The cog tools fan rates server-side in ONE Angular cycle → ONE recap → ONE PDF. Per-row `set_estimate_rate` triggers a separate auto-recap per call (even with the 4s coalesce defending against parallel bursts) — for 4 rows that's 4 recaps and 4 PDFs (v2/v3/v4/v5) instead of 1. The cost difference is real and user-visible (Downloads folder clutter + ~50-70s extra wall time per multi-row request). Documented anti-pattern observed run-20260525-212237 + run-20260525-214740.
+
+`apply_estimate_rate_to_all_matching` (substring-matched subtype filter) is the broader sledgehammer for CROSS-GROUP rate apply ("every TMC in the order, regardless of group, $X") — cogs operate within one group at a time. Default to the cog tools first; reach for `apply_estimate_rate_to_all_matching` only when the cog scopes can't express the intent. Use these when the user wants to amend subtypes or negotiate rates ("the TMCs are $400 each, not standard rate"; "change line 2 to volume+class"). Workflow:
 1. Always call `get_estimate_lines` first to see current state (it re-reads the modal, not the stale initial capture).
-2. For subtype edits: `list_estimate_subtype_options(line_index)` on one matching row first to read the exact option text, then `set_estimate_subtype` on each matching row.
+2. For subtype edits: `list_estimate_subtype_options(line_number=N)` on one matching row first to read the exact option text, then `set_estimate_subtype` on each matching row.
 3. Make the edits (`set_estimate_subtype` / `set_estimate_rate` / `apply_estimate_rate_to_all_matching`).
 4. When the user is satisfied, call `re_capture_estimate` to save and download a fresh PDF (`_v2`, `_v3`, … in Downloads).
 The user can also click PREVIEW manually in the qchub browser at any time — your tools and their clicks don't interfere.
 
-**LINE NUMBERING IS 1-BASED at the user boundary.** qchub's UI shows estimate lines starting at **Line 1** (not Line 0). When the user says "line 1", "line 7", "the first three lines" — they mean qchub's 1-based count. When you report lines back to the user, use 1-based too: "Line 1 is Lorraine Rd…", not "Line 0 is…". INTERNALLY, the tools take 0-based `line_index` (matches array indexing) — so subtract 1 when calling a tool from a user-given line number, and add 1 when quoting a line number back to the user. Get this wrong silently and the user edits the wrong row.
+**LINE NUMBERING IS 1-BASED EVERYWHERE.** qchub's UI shows estimate lines starting at **Line 1** (not Line 0). Tools take `line_number` (1-based) directly — no subtraction needed. When the user says "line 1" / "lines 2-5" / "the first three lines", pass those numbers verbatim to `set_estimate_subtype(line_number=...)`, `set_estimate_rate(line_number=...)`, `list_estimate_subtype_options(line_number=...)`. When reporting back, use the same 1-based numbers ("Line 1 is Lorraine Rd…", not "Line 0 is…"). The `get_estimate_lines` response includes both `index` (internal, 0-based, ignore) and `line_number` (1-based, this is what tools want and what the user means). Prior failure mode (run-20260525-212237): user said "change sites 1-4", Ellen passed `line_index=1,2,3,4`, qchub UI rows 2-5 changed. With `line_number` as the parameter name, that mistake is no longer possible.
 
 **NEVER ASK THE USER FOR LINE INDICES.** Users think in terms of "the roundabout", "the TMCs", "line 2 with the 250 E address" — not line numbers. When the user describes a row, call `get_estimate_lines`, match their description against the `description` field of each line (case-insensitive substring match against site name, time window, or subtype), and pick the index yourself. If the user's description matches MULTIPLE lines (e.g., "the roundabout" matches both AM and PM peak rows for that site), apply the edit to ALL matching lines (call set_estimate_subtype / set_estimate_rate once per matching index). If the description matches zero lines, surface the available descriptions and ask for clarification — never ask for an index number.
 
@@ -1017,9 +1111,8 @@ Good: "Custom Video Survey rows set to $400, updated PDF saved as _v2. Anything 
 Tasks that trigger this close (each one ONLY after the artifact for that task is delivered):
 - Initial estimate captured + PDF is in Downloads (after qchub order + estimate capture complete)
 - Map ready + share link copied to clipboard (after MyMaps finishes)
-- Any rate edit applied + PDF re-captured (after `apply_estimate_rate_to_all_matching` or `set_estimate_rate`)
-- Any subtype change applied + PDF re-captured (after `set_estimate_subtype`)
-- Explicit re-capture finished (after `re_capture_estimate`)
+- A USER REQUEST FOR ESTIMATE EDITS is fully applied + the SINGLE final PDF re-capture has landed in Downloads. Critical: "fully applied" means EVERY row the user asked about (could be 1 row, could be 20). Do NOT close after each individual `set_estimate_subtype` / `set_estimate_rate` call within a batched request — wait for the final `re_capture_estimate` of the batch (see the "BATCH MULTI-ROW ESTIMATE EDITS" rule below). The close is "all 4 TMC rows set to Large, _v2.pdf saved. Anything else?" — NOT four separate closes for four separate recaps.
+- Explicit re-capture finished (after `re_capture_estimate` called on its own with no preceding edits)
 - Draft email window opened in Outlook (after `draft_email_reply`)
 
 **Turns that DO NOT trigger the close — use a FORWARD-LOOKING question instead, not "anything else?".** Repeat offense flagged by user 2026-05-25: Ellen kept asking "anything else?" on the opening summary turn before any artifact had been created. "Anything else?" is wrong there because the user hasn't asked you to do anything yet — there's nothing to be "else" relative to. Use it ONLY when something tangible just landed.
@@ -1040,13 +1133,34 @@ The close prompt is brief — one sentence after your normal task report. Do NOT
 
 Acknowledge once briefly ("got it" / "all set" / "great") and call `end_session` — do NOT summarize what was done. Do NOT fire end_session if the user's reply is a new task, a follow-up question, or any ambiguous response (e.g., "wait", "hmm", "let me think"). When in doubt, ask one clarifying question rather than guessing.
 
-**PRE-SUBMIT PRICING INSTRUCTIONS — APPLY THEM ON THE FIRST ESTIMATE.** The user often tells you pricing BEFORE the qchub order runs ("approach counts $200 each", "set TMCs at $400 flat"). Today the tools (`set_estimate_rate`, `apply_estimate_rate_to_all_matching`) only work on the LIVE estimate modal, which exists AFTER the order is submitted. Don't make the user re-state their pricing after the estimate appears — handle it in one pass:
-1. When the user gives pre-submit pricing, acknowledge it ("Got it — $200 per approach row, will apply once the estimate is up"). Don't forget it; treat it as a pending instruction that survives the order run.
-2. The instant the qchub order completes and you have the live edit session (`estimate_pdf_path` shows up in artifacts, signaling the modal is open), IMMEDIATELY apply every pending pricing instruction via `apply_estimate_rate_to_all_matching` (or `set_estimate_rate` for per-row), THEN call `re_capture_estimate` to refresh the PDF.
-3. Only AFTER the pricing is applied + PDF re-captured do you report to the user — confirming the pricing was applied and the updated PDF is in Downloads. Do NOT quote a dollar total (see "NEVER quote a dollar total in chat" rule below).
-4. If you have NO pending pricing instructions, skip steps 2-3 entirely and just report the v1 PDF as usual.
+**PRE-SUBMIT PRICING + SUBTYPE INSTRUCTIONS — APPLY THEM ON THE FIRST ESTIMATE.** The user often tells you pricing OR subtype corrections BEFORE the qchub order runs ("approach counts $200 each", "set TMCs at $400 flat", "the roundabout is Complex", "all 4 are Large"). Today the tools (`set_estimate_rate`, `apply_estimate_rate_to_all_matching`, `set_estimate_subtype`) only work on the LIVE estimate modal, which exists AFTER the order is submitted. Don't make the user re-state these after the estimate appears — handle it in one pass:
+1. When the user gives a pre-submit pricing OR subtype instruction, acknowledge it ("Got it — $200 per approach row, will apply once the estimate is up" / "Got it — flipping the roundabout to Complex on the estimate"). Don't forget it; treat it as a pending instruction that survives the order run.
+2. The instant the qchub order completes and you have the live edit session (`estimate_pdf_path` shows up in artifacts, signaling the modal is open), apply EVERY pending instruction. Pricing → `apply_estimate_rate_to_all_matching` (or `set_estimate_rate` per-row). Subtype → call `list_estimate_subtype_options` on a matching row once to confirm the exact option text, then `set_estimate_subtype` per matching row. **Batch ALL the per-row tool calls in a SINGLE response** (parallel tool calls), THEN call `re_capture_estimate` ONCE at the end. ONE recap covers the whole batch — do NOT recap between per-row edits (see "BATCH MULTI-ROW ESTIMATE EDITS" below).
+3. Only AFTER the batch is applied + the single PDF re-captured do you report to the user — confirming what was applied and that the updated PDF is in Downloads. Do NOT quote a dollar total (see "NEVER quote a dollar total in chat" rule below).
+4. If you have NO pending instructions, skip steps 2-3 entirely and just report the v1 PDF as usual.
 
-This pattern eliminates the "Ellen ran the estimate, ignored my pricing, then I had to ask again" loop. Capture and apply, don't capture and forget.
+This pattern eliminates the "Ellen ran the estimate, ignored my pricing/subtype correction, then I had to ask again" loop. Capture and apply, don't capture and forget. Also catches the case flagged 2026-05-25 where the user said "make the roundabout Complex" pre-submit and Ellen acknowledged but didn't apply it — that's a pending subtype instruction the same way "$400 flat" is a pending pricing instruction.
+
+**BATCH MULTI-ROW ESTIMATE EDITS — edit tools NO LONGER auto-recap. You MUST call re_capture_estimate explicitly after your batch.** (Auto-recap was removed 2026-05-26 morning after repeated per-row recap incidents — it forced sequential behavior because each edit call blocked 18s waiting for its chained recap.) Every edit-tool response now includes `"pdf_state": "STALE"` as a visible reminder.
+
+**Pattern for ANY request that touches estimate rows:**
+
+1. **Fire ALL the edit calls in the SAME response** (parallel tool calls — the runtime executes them concurrently). This works for any mix: `set_estimate_subtype`, `set_estimate_rate`, `apply_rate_to_location`, `apply_rate_to_all_locations`, etc. Edit tools now return in ~1s each so parallelism is real and visible.
+
+2. **In your NEXT response, call `re_capture_estimate` exactly ONCE** (after all the parallel tool results have come back). This is THE recap that refreshes the PDF — without it, the saved PDF still shows the pre-edit state.
+
+3. **Report with the close prompt** ("All 4 TMC rows set to Large, updated PDF saved as _v2. Anything else?").
+
+**Pitfalls to avoid:**
+- Do NOT call `re_capture_estimate` between per-row edits in the same logical batch.
+- Do NOT skip `re_capture_estimate` — every batch ends with one, no exceptions.
+- Do NOT fire edits one-at-a-time across multiple responses when they're one user request — that's the pattern that caused the run-20260525-212237 + run-20260526-113813 problems.
+
+**Single-row edits**: ONE edit + ONE recap in the same two-response pattern. The batch happens to have size 1; the recap is still mandatory.
+
+**MULTIPLE distinct user requests** (separate turns, separate intent): each gets its own batch + recap cycle. ONE request = ONE batch = ONE recap, no matter how many rows it touches.
+
+**ESTIMATE MODAL IS OPEN AS SOON AS THE "Order N submitted" CONFIRMATION POSTS.** The qchub run-action's completion note explicitly says "Estimate modal is OPEN" — that's a hard signal, not a hint. Do NOT say "I'll apply this when the modal is live" — by the time you're reading the order-submitted note, the modal IS live by definition. The qchub_edit_session is wired and tools work. **Apply any pending pre-submit instructions in your VERY NEXT response, not in some future "when the modal comes up" turn.** Observed 2026-05-26 run-20260526-113813: Ellen said "I'll flip line 9 to Complex when the modal is live" 60+ seconds after the modal was live — that's a hallucination of state. Don't repeat it.
 
 **MyMaps result check**: when the user asks about the map link or you reference a map you created, ALWAYS call `get_artifacts` first. If `mymaps_failed=True`, tell the user the map failed (use the `mymaps_error` message) and ask whether to retry or export a KMZ instead. If `mymaps_share_url` is set, that's the link. If neither is set and `mymaps_in_progress=True`, the map is still being built — tell the user to give it a moment and check back. Never tell the user to "check the MyMaps tab" — artifacts is the source of truth.
 
@@ -1133,12 +1247,19 @@ def _summarize_kmz_attachment(att) -> str:
     return "\n".join(lines)
 
 
+_RECAP_COALESCE_SEC = 4.0
+_recap_state_lock = threading.Lock()
+# Per-session coalesce state. Keyed by `id(qchub_edit_session)` so each
+# distinct order's recaps coalesce independently (multi-order future-proof).
+# Each entry: {"latest_serial": int, "last_real_result": dict | None,
+#              "counter": int, "in_flight_lock": threading.Lock}.
+_recap_state: dict[int, dict] = {}
+
+
 def _auto_recapture(qchub_edit_session) -> dict:
     """Chain a re_capture after an estimate edit so the saved PDF is
-    always in sync with the latest edit. Returns the re_capture result
-    (version + pdf_path + ...) or an error dict if the recapture
-    failed — the EDIT itself already succeeded by the time this runs,
-    so we never raise.
+    always in sync with the latest edit, BUT coalesce bursts of recap
+    requests so a batch of parallel edits produces ONE PDF, not N.
 
     Why this exists (user direction 2026-05-25): after Ellen made an
     edit she'd often stop and let the user open Estimate_NNNNN.pdf —
@@ -1146,24 +1267,92 @@ def _auto_recapture(qchub_edit_session) -> dict:
     separate tool call she didn't always make. Auto-chaining here
     means every edit call atomically refreshes the PDF.
 
-    Slow-path: each re_capture adds ~10-15s (PDF download + write).
-    For bulk edits via apply_rate_to_all_matching that's still ONE
-    re-capture (one tool call from Ellen). For sequences of
-    per-row edits the user incurs N re-captures, which is suboptimal
-    but always-correct. Optimize later if it becomes a UX problem.
+    Why coalesce (user direction 2026-05-25 night): per-edit recap was
+    producing v2/v3/v4/v5 PDFs for a 4-row batch in run-20260525-212237
+    (~80s wasted on N redundant 17s recaps + Downloads clutter). The
+    coalesce strategy: each call gets a serial number; sleeps for
+    `_RECAP_COALESCE_SEC`; after the sleep, if a NEWER call superseded
+    it, return the most recent cached result without recapturing. Only
+    the latest serial in a burst window does the actual recap.
+
+    Net effect:
+      - Single edit:        sleep 4s, then recap (one PDF). Cost: ~+4s.
+      - 4 parallel edits:   all sleep 4s; one recaps (one PDF), three
+                            return the same cached result. Cost: ~+4s
+                            total instead of 4 × 17s.
+      - 4 sequential edits (Ellen still doing the wrong pattern): each
+                            edit still triggers its own recap, but the
+                            4s coalesce gives the model time to fire a
+                            second edit; if it doesn't (truly sequential
+                            with model waiting on result), we degrade to
+                            the pre-coalesce per-edit cadence + 4s
+                            overhead each. Worst case ≈ status quo.
+
+    Returns the re_capture result (version + pdf_path + ...) or an error
+    dict if the recapture failed — the EDIT itself already succeeded by
+    the time this runs, so we never raise.
     """
-    try:
-        return qchub_edit_session.re_capture()
-    except Exception as exc:
-        return {
-            "error": (
-                f"Edit applied but auto-recapture failed: "
-                f"{type(exc).__name__}: {exc}. "
-                f"The edit IS live in the qchub modal; the saved PDF "
-                f"is the pre-edit version. User can call "
-                f"re_capture_estimate explicitly to refresh."
-            ),
-        }
+    import time as _time
+
+    session_key = id(qchub_edit_session)
+    with _recap_state_lock:
+        st = _recap_state.setdefault(session_key, {
+            "request_counter": 0,
+            "last_recap_at_request": 0,
+            "last_real_result": None,
+            "in_flight_lock": threading.Lock(),
+        })
+        st["request_counter"] += 1
+        my_request = st["request_counter"]
+        in_flight_lock = st["in_flight_lock"]
+
+    # Wait for any further recap requests to arrive in this burst. The
+    # edit that triggered THIS call has already been applied to qchub
+    # (the dispatcher runs the edit synchronously before calling us),
+    # so any recap that runs after this sleep window will pick up the
+    # edit regardless of which serial drives it.
+    _time.sleep(_RECAP_COALESCE_SEC)
+
+    # Coalesce check #1: did a recap already happen AFTER my request was
+    # registered? If so, my edit is included in that recap's result and
+    # mine would be redundant. Compare last_recap_at_request to my_request.
+    with _recap_state_lock:
+        if (
+            st["last_recap_at_request"] >= my_request
+            and st["last_real_result"] is not None
+        ):
+            return {**st["last_real_result"], "coalesced": True, "serial": my_request}
+
+    # Acquire the in-flight lock so only ONE actual recap runs at a time
+    # per session. Other coalesced callers may already be waiting here.
+    with in_flight_lock:
+        # Coalesce check #2: re-check after grabbing the lock. The recap
+        # we were waiting on (if any) may have finished while we blocked.
+        with _recap_state_lock:
+            if (
+                st["last_recap_at_request"] >= my_request
+                and st["last_real_result"] is not None
+            ):
+                return {**st["last_real_result"], "coalesced": True, "serial": my_request}
+        try:
+            result = qchub_edit_session.re_capture()
+            # Record the CURRENT request_counter (which may be higher than
+            # my_request if other threads queued during our work) so any
+            # peer waiting in the burst window sees their edit covered.
+            with _recap_state_lock:
+                st["last_real_result"] = result
+                st["last_recap_at_request"] = st["request_counter"]
+            return result
+        except Exception as exc:
+            return {
+                "error": (
+                    f"Edit applied but auto-recapture failed: "
+                    f"{type(exc).__name__}: {exc}. "
+                    f"The edit IS live in the qchub modal; the saved PDF "
+                    f"is the pre-edit version. User can call "
+                    f"re_capture_estimate explicitly to refresh."
+                ),
+            }
 
 
 def _scrub_dollars_from_estimate_result(result):
@@ -1180,8 +1369,10 @@ def _scrub_dollars_from_estimate_result(result):
     number; she has to point the user at the PDF.
 
     Preserves fields Ellen NEEDS for orchestration: description,
-    raw_text, line_index, pdf_path, version — everything useful for
-    matching rows + reporting which version of the PDF is current.
+    raw_text, line_number, index, pdf_path, version — everything useful
+    for matching rows + reporting which version of the PDF is current.
+    `line_number` is the 1-based row number Ellen uses to address tools;
+    `index` is the legacy 0-based internal counter (kept for back-compat).
 
     Works on dicts, lists of dicts, and nested structures. No-op on
     primitives + on dicts that don't contain any of the scrubbed keys.
@@ -1283,31 +1474,38 @@ def execute_tool(
                     payload = {"order_id": qchub_edit_session.order_id, "lines": lines}
                     return json.dumps(_scrub_dollars_from_estimate_result(payload), indent=2)
                 if name == "list_estimate_subtype_options":
-                    result = qchub_edit_session.list_subtype_options(int(args["line_index"]))
+                    # line_number is 1-based (qchub UI); internal API is 0-based.
+                    result = qchub_edit_session.list_subtype_options(int(args["line_number"]) - 1)
                     return json.dumps(_scrub_dollars_from_estimate_result(result), indent=2)
-                # The three edit tools (set_estimate_subtype,
-                # set_estimate_rate, apply_estimate_rate_to_all_matching)
-                # automatically chain a re_capture so the PDF in
-                # Downloads is always fresh after Ellen makes a change.
-                # Without this, Ellen routinely "applies $400 to all
-                # rows" and then stops — leaving a stale PDF the user
-                # opens expecting updated numbers (observed
-                # run-20260524-232317).
+                # Edit tools DO NOT auto-recap. Removed 2026-05-26 morning
+                # after run-20260526-113813 showed Ellen's per-row recap
+                # pattern persisting despite the 4s coalesce: she waits for
+                # the auto-chained recap to return before issuing the next
+                # edit, defeating any parallel-call benefit. Edit tools now
+                # return in ~1s; Ellen MUST explicitly call re_capture_estimate
+                # after her batch (single tool call) to refresh the PDF.
+                # The "BATCH MULTI-ROW ESTIMATE EDITS" rule in the system
+                # prompt is now load-bearing. Edit responses include
+                # `pdf_state: "STALE"` as a visible reminder.
+                _STALE = {"pdf_state": "STALE — call re_capture_estimate after your batch to refresh the PDF"}
+
                 if name == "set_estimate_subtype":
-                    edit = qchub_edit_session.set_subtype(int(args["line_index"]), str(args["subtype"]))
-                    recap = _auto_recapture(qchub_edit_session)
+                    # line_number is 1-based (qchub UI); internal API is 0-based.
+                    edit = qchub_edit_session.set_subtype(
+                        int(args["line_number"]) - 1, str(args["subtype"]),
+                    )
                     return json.dumps(_scrub_dollars_from_estimate_result(
-                        {"edit": edit, "recapture": recap}
+                        {"edit": edit, **_STALE}
                     ), indent=2)
                 if name == "set_estimate_rate":
+                    # line_number is 1-based (qchub UI); internal API is 0-based.
                     edit = qchub_edit_session.set_rate(
-                        int(args["line_index"]),
+                        int(args["line_number"]) - 1,
                         float(args["unit_price"]),
                         extra_rate=float(args.get("extra_rate", 0.0)),
                     )
-                    recap = _auto_recapture(qchub_edit_session)
                     return json.dumps(_scrub_dollars_from_estimate_result(
-                        {"edit": edit, "recapture": recap}
+                        {"edit": edit, **_STALE}
                     ), indent=2)
                 if name == "apply_estimate_rate_to_all_matching":
                     edit = qchub_edit_session.apply_rate_to_all_matching(
@@ -1315,9 +1513,31 @@ def execute_tool(
                         float(args["unit_price"]),
                         extra_rate=float(args.get("extra_rate", 0.0)),
                     )
-                    recap = _auto_recapture(qchub_edit_session)
                     return json.dumps(_scrub_dollars_from_estimate_result(
-                        {"edit": edit, "recapture": recap}
+                        {"edit": edit, **_STALE}
+                    ), indent=2)
+                # Native-cog bulk-apply trio. Each takes a single line_number
+                # belonging to the target location, sets the rate on that
+                # location's cog-bearing row, then picks the scoped menu
+                # item. qchub fans the rate out server-side -> ONE Angular
+                # cycle. Still no auto-recap; Ellen calls re_capture_estimate
+                # once after her batch (which may be just the single cog
+                # call if all rows share rates).
+                # Documented in project_qchub_estimate_cog_bulk_apply.md.
+                if name in ("apply_rate_to_location", "apply_rate_to_all_locations", "apply_rate_to_rest_of_group"):
+                    scope = {
+                        "apply_rate_to_location": "location",
+                        "apply_rate_to_all_locations": "all",
+                        "apply_rate_to_rest_of_group": "rest",
+                    }[name]
+                    edit = qchub_edit_session.apply_rate_via_cog(
+                        int(args["line_number"]) - 1,  # 1-based -> 0-based
+                        scope,
+                        float(args["unit_price"]),
+                        extra_rate=float(args.get("extra_rate", 0.0)),
+                    )
+                    return json.dumps(_scrub_dollars_from_estimate_result(
+                        {"edit": edit, **_STALE}
                     ), indent=2)
                 if name == "re_capture_estimate":
                     # Direct re-capture still available for Ellen to

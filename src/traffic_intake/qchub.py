@@ -94,7 +94,7 @@ class CreateOrderResult:
 
 @dataclass
 class _EditCommand:
-    kind: str  # "get_lines" | "set_subtype" | "set_rate" | "apply_rate_to_all" | "re_capture"
+    kind: str  # "get_lines" | "set_subtype" | "set_rate" | "apply_rate_to_all" | "apply_rate_via_cog" | "re_capture"
     payload: dict
     reply: "queue.Queue[tuple[str, Any]]" = field(default_factory=lambda: queue.Queue(maxsize=1))
     cid: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
@@ -200,6 +200,31 @@ class QchubEditSession:
         """
         return self._dispatch("apply_rate_to_all", {
             "subtype_contains": subtype_contains,
+            "unit_price": float(unit_price),
+            "extra_rate": float(extra_rate),
+        })
+
+    def apply_rate_via_cog(
+        self, line_index: int, scope: str, unit_price: float, extra_rate: float = 0.0,
+    ) -> dict:
+        """Drive qchub's native per-location cog wheel to bulk-apply a
+        rate across multiple rows in one server-side action. Strictly
+        better than calling set_rate per row when the target rows share
+        a location or group — one tool call, one Angular cycle, one PDF.
+
+        `scope`:
+          - "location" → propagate within the row's own location only
+          - "all"      → propagate to ALL locations in the group
+          - "rest"     → propagate to OTHER locations (excl. this one)
+
+        `line_index` may reference ANY row of the target location; the
+        helper walks DOM siblings backward to find that location's
+        cog-bearing first row. Returns {scope, picked, set_base,
+        set_extra, lines}.
+        """
+        return self._dispatch("apply_rate_via_cog", {
+            "line_index": int(line_index),
+            "scope": scope,
             "unit_price": float(unit_price),
             "extra_rate": float(extra_rate),
         })
@@ -969,6 +994,13 @@ def _run(
             elif estimate:
                 note_parts.append("Estimate captured (no lines parsed — see HTML).")
             note_parts.append("Browser left open for verification.")
+            # NOTE: Modal-is-open / apply-pending-instructions guidance USED
+            # to live here, but it leaked developer language ("edit tools
+            # are live", "VERY NEXT response", "do not wait") into the
+            # user-visible chat (user feedback 2026-05-26 run-20260526-120226).
+            # The same guidance now lives in app.py's `_fire_post_qchub_turn`
+            # synthetic chat turn, which is sent ONLY to Ellen and never
+            # rendered in the chat panel. Keep this user-visible note clean.
             note = " ".join(note_parts)
         else:
             note = "Submit clicked but order ID wasn't captured. Verify in the browser."
@@ -1000,9 +1032,17 @@ def _run(
         # checking for browser-closed. Replaces the old wait_for_event
         # so Ellen can drive subtype/rate edits + re-capture against
         # the live page.
+        # Threaded through so the recap version counter starts at the
+        # right place. False (initial capture deferred the PDF) = Ellen's
+        # first recap writes Estimate_NNNNN.pdf (no suffix); True = first
+        # recap writes _v2.
+        initial_pdf_saved = (
+            estimate is not None and getattr(estimate, "pdf_path", None) is not None
+        )
         _dispatch_edit_commands_until_done(
             context, page, edit_session, order_id, log,
             timeout_sec=manual_finish_timeout_sec,
+            initial_pdf_saved=initial_pdf_saved,
         )
 
         return result
@@ -2046,6 +2086,12 @@ def _upload_kml(page: Page, kml_path: Path, log: ProgressCallback) -> None:
 
     qchub's importer expects `.kml`. UI button text is "UPLOAD KML".
     """
+    # Defensive: if the post-CREATE-GROUP Info Alert is STILL up at upload
+    # time (the post-create dismiss missed it, or it appeared late), clear
+    # it now or its overlay will block the UPLOAD KML button click. Quick
+    # 500ms probe — alert is either present and we dismiss, or it isn't
+    # and we skip. Established 2026-05-25 night Sarasota run.
+    _dismiss_info_alert(page, log, wait_ms=500)
     try:
         with page.expect_file_chooser(timeout=15_000) as fc_info:
             try:
@@ -2560,8 +2606,15 @@ def _drive_one_group(
             "Check the diagnostic page.html for which field qchub flagged."
         )
 
-    # The "Info Alert" pops up after the first group with a CONTINUE button.
-    _dismiss_info_alert(page, log)
+    # The "Info Alert" pops up after EACH group with a CONTINUE button.
+    # qchub renders it async after the server responds to CREATE GROUP, so
+    # the alert may not be visible at this exact instant — wait up to 6s
+    # for it to render before giving up. If we proceed to KML upload while
+    # the alert is mid-render, its overlay blocks the upload click and the
+    # bind never completes (Sarasota run 2026-05-25 night, 28-pin tube
+    # group). _upload_kml also calls _dismiss_info_alert defensively to
+    # catch any late-arriving alert that beats this wait.
+    _dismiss_info_alert(page, log, wait_ms=6_000)
 
     # Per John Goodwin's workflow: upload THIS group's KML while it's still
     # the active selection in qchub. qchub may auto-reopen the Add Study
@@ -3285,7 +3338,9 @@ def _fill_start_time_input(modal, value: str, log: ProgressCallback) -> bool:
     return False
 
 
-def _dismiss_info_alert(page: Page, log: ProgressCallback) -> None:
+def _dismiss_info_alert(
+    page: Page, log: ProgressCallback, *, wait_ms: int = 2_000,
+) -> None:
     """Dismiss the 'Now please, add at least one location…' Info Alert that
     qchub pops after CREATE GROUP and at other workflow checkpoints.
 
@@ -3294,12 +3349,21 @@ def _dismiss_info_alert(page: Page, log: ProgressCallback) -> None:
     `.first.is_visible()` check inspects a HIDDEN variant first, returns False,
     and we silently skip the click — leaving the real alert blocking the page.
     Scope the search to `div.modal.fade.in` to avoid that trap.
+
+    `wait_ms` controls how long we'll wait for the alert to BECOME visible
+    before giving up. Callers right after CREATE GROUP should pass a generous
+    value (~6000ms) because qchub's Angular renders the alert async after the
+    server responds; the default 2000ms is right for "alert is either there
+    now or never coming" checkpoints. Sized 6000ms after Sarasota
+    order-176597-adjacent run 2026-05-25 night: 28-pin TUBE group's alert
+    rendered AFTER the 2s post-CREATE-GROUP check, leaving the alert overlay
+    in place during KML upload — bind never completed, submit-gate timed out.
     """
     try:
         alert = page.locator("div.modal.fade.in").filter(
             has_text=re.compile(r"add\s+at\s+least\s+one\s+location", re.IGNORECASE)
         ).first
-        if alert.is_visible(timeout=2_000):
+        if alert.is_visible(timeout=wait_ms):
             alert.get_by_role("button", name=re.compile(r"^\s*continue\s*$", re.IGNORECASE)).first.click(timeout=3_000)
             log("Dismissed Info Alert.")
     except Exception:
@@ -3383,7 +3447,7 @@ def _group_locations_for_qchub(request: StudyRequest) -> list[dict[str, Any]]:
 
 
 def _wait_for_form_populated_before_submit(
-    page: Page, log: ProgressCallback, *, budget_sec: float = 20.0,
+    page: Page, log: ProgressCallback, *, budget_sec: float = 45.0,
 ) -> None:
     """Positive-signal gate before SUBMIT REQUEST. Polls until qchub's
     Angular state reports a non-empty `alertsRequest` array (the array
@@ -3411,6 +3475,15 @@ def _wait_for_form_populated_before_submit(
     On timeout, raises QchubError with a clear message instead of
     letting the silent-reject path swallow the run. The user can
     re-try; usually the upload completes in 5-10s on retry.
+
+    Budget history: 20s (2026-05-25 PM, initial) → 45s (2026-05-25 night
+    after order-176597-ish 28-pin tube group blew the 20s budget on the
+    Sarasota Kimley-Horn email). The 20s budget was sized against a
+    7-pin TMC; bigger KMLs (20+ pins) need more bind time, plus we
+    saw real-world server-side slow moments. 45s is enough that a
+    truly stuck bind still bails in well under a minute, but doesn't
+    leave the user staring at "Waiting for KML upload..." for 80s+
+    on a slow-but-recoverable run.
 
     Established 2026-05-25 from order-176588-adjacent failed Winchester
     run; user pasted dev console showing alertsRequest.length 0 at
@@ -3701,7 +3774,7 @@ def _apply_outliers_to_estimate_modal(
 
 def _capture_estimate(
     page: Page, order_id: str, run_dir: Path, log: ProgressCallback,
-    *, request: Optional[StudyRequest] = None,
+    *, request: Optional[StudyRequest] = None, download_pdf: bool = False,
 ) -> Optional[Estimate]:
     """After SUBMIT REQUEST redirected us to /Admin/Orders/{id}, open the
     Estimate modal and capture the priced lines so the user can review
@@ -3718,9 +3791,16 @@ def _capture_estimate(
       4. Best-effort parse: each editable row has a `<select>` (subtype)
          next to two `<input type="number">` (unit price + quantity).
          Walk those to extract structured lines.
-      5. Optionally trigger PREVIEW to download the PDF artifact, captured
-         via `expect_download` so the user's browser doesn't pop a Save
-         As dialog.
+      5. (Optional, only when `download_pdf=True`) Trigger PREVIEW to
+         download the PDF artifact. Default is FALSE — the initial
+         capture skips the PDF so users don't end up with both
+         Estimate_NNNNN.pdf (pre-edit, useless) and
+         Estimate_NNNNN_v2.pdf (post-edit, the one they actually
+         wanted) cluttering Downloads (user feedback 2026-05-26).
+         Ellen's first `re_capture_estimate` produces the FIRST and
+         ONLY PDF in the common case. Set to True only when callers
+         need a PDF immediately (e.g., a non-chat consumer that won't
+         drive Ellen's edit flow).
 
     Returns None if the modal can't be opened — caller treats it as "no
     estimate captured" rather than failing the whole order.
@@ -3829,6 +3909,29 @@ def _capture_estimate(
     # picks document-order which is the top inert button — observed
     # run-20260514-225436. Use `.last` to hit the footer button.
     pdf_path: Optional[Path] = None
+    if not download_pdf:
+        # Skip the PDF download. The caller (initial qchub capture by
+        # default) wants the parsed line state + HTML snapshot only;
+        # Ellen's first re_capture_estimate will produce the FIRST PDF
+        # (after she applies any pending pre-submit instructions), so
+        # the user sees ONE PDF in Downloads instead of v1 + v2.
+        log("(Initial capture: skipping PDF download — Ellen's first re_capture will produce the PDF.)")
+        # Fold the auto-applied subtype summary into parse_note (same
+        # logic as the post-PDF return below) so Ellen can see what
+        # corrections were made.
+        if auto_applied_summary:
+            note_extra = "Auto-applied subtype outliers: " + "; ".join(auto_applied_summary)
+            parse_note = f"{parse_note}\n{note_extra}" if parse_note else note_extra
+        return Estimate(
+            order_id=order_id,
+            order_url=page.url,
+            lines=lines,
+            total=grand_total,
+            html_path=str(html_path) if html_path else None,
+            screenshot_path=str(png_path) if png_path else None,
+            pdf_path=None,
+            parse_note=parse_note,
+        )
     captured_downloads: list = []
     captured_pdf_responses: list = []
 
@@ -4177,8 +4280,14 @@ def _parse_estimate_rows_from_modal(modal) -> list[EstimateLine]:
 
 
 def _estimate_line_to_dict(L: EstimateLine, index: int) -> dict:
+    # `index` is the internal 0-based array index. `line_number` is the
+    # 1-based row number qchub's UI displays — also what the user means
+    # when they say "line 3". Tools (set_estimate_subtype etc.) take
+    # `line_number` as input. `index` is retained for internal/legacy
+    # use but Ellen should reference `line_number` when calling tools.
     return {
         "index": index,
+        "line_number": index + 1,
         "description": L.description,
         "unit_price": L.unit_price,
         "quantity": L.quantity,
@@ -4312,6 +4421,181 @@ def _js_set_rate_on_row(
         }""",
         {"rowIndex": row_index, "basePrice": base_price, "extraRate": extra_rate},
     )
+
+
+_COG_SCOPE_LABELS = {
+    # Map our scope tag → exact qchub menu-item text.
+    # qchub option whitespace memory applies: never `exact=True`. We use a
+    # whitespace-tolerant regex in the JS picker; these are the canonical
+    # forms verified from run-20260525-214740 captured estimate HTML +
+    # user screenshot.
+    "location": "Apply rate to Location",
+    "all":      "Apply location rates to all",
+    "rest":     "Apply location rates to rest",
+}
+
+
+def _apply_rate_via_cog(
+    page: Page, row_index: int, base_price: float, extra_rate: float, scope: str,
+) -> dict:
+    """Use qchub's per-LOCATION cog wheel to set rates on multiple rows
+    in one shot. The cog is anchored to the FIRST time-window row of each
+    location; clicking it reveals a 3-item dropdown:
+
+      - "Apply rate to Location"        — propagate within this location only
+      - "Apply location rates to all"   — propagate to ALL locations in the group
+      - "Apply location rates to rest"  — propagate to OTHER locations (excl. this one)
+
+    The caller passes any row_index belonging to the target location;
+    this function walks DOM siblings backward to find the cog-bearing
+    row, sets its rate inputs, opens the dropdown, and clicks the
+    matching menu item. qchub then fans the rate out server-side.
+
+    Steps are split into two `page.evaluate` calls because the dropdown
+    menu is rendered dynamically by Angular AFTER the cog click —
+    waiting between the two JS calls gives the menu time to mount.
+
+    Returns: {ok, base, extra, picked, error?}.
+    """
+    scope_label = _COG_SCOPE_LABELS.get(scope)
+    if scope_label is None:
+        return {"ok": False, "error": f"unknown cog scope {scope!r}; expected one of {list(_COG_SCOPE_LABELS)}"}
+
+    # Step 1: locate the row, normalize to the cog-bearing row, set its
+    # rate inputs, open the dropdown.
+    open_result = page.evaluate(
+        r"""({rowIndex, basePrice, extraRate}) => {
+            const modal = document.querySelector('div.modal.fade.in');
+            if (!modal) return {ok: false, error: 'modal not visible'};
+            const selects = Array.from(modal.querySelectorAll('select')).filter(sel => {
+                const first = (sel.options[0]?.text || '').trim();
+                return / -- /.test(first);
+            });
+            if (rowIndex < 0 || rowIndex >= selects.length) {
+                return {ok: false, error: 'row index out of range', n_rows: selects.length};
+            }
+            const sel = selects[rowIndex];
+            let myRow = sel.closest('div.row.ng-star-inserted');
+            if (!myRow) {
+                let p = sel.parentElement;
+                for (let i = 0; i < 6 && p; i++) {
+                    if (p.querySelector('input[id$="rate"]')) { myRow = p; break; }
+                    p = p.parentElement;
+                }
+            }
+            if (!myRow) return {ok: false, error: 'row container not found'};
+
+            // The per-location cog is anchored to the FIRST time-window row of
+            // each location. If myRow has its own cog, use it. Otherwise walk
+            // backward through sibling rows until we hit a row with a cog.
+            let cogRow = null;
+            if (myRow.querySelector('span.glyphicon-cog')) {
+                cogRow = myRow;
+            } else {
+                let prev = myRow.previousElementSibling;
+                while (prev) {
+                    if (prev.querySelector && prev.querySelector('span.glyphicon-cog')) {
+                        cogRow = prev;
+                        break;
+                    }
+                    prev = prev.previousElementSibling;
+                }
+            }
+            if (!cogRow) return {ok: false, error: 'no cog button found for this location (location boundary unclear)'};
+
+            // qchub propagates the COG-BEARING row's rates, not the row you
+            // happened to address. Set them on the cog row.
+            const rateInput = cogRow.querySelector('input[id$="rate"]');
+            const extraInput = cogRow.querySelector('input[id$="extra"]');
+            if (!rateInput) return {ok: false, error: 'rate input not found on cog row'};
+            const setNative = (inp, val) => {
+                const setter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value'
+                ).set;
+                setter.call(inp, String(val));
+                inp.dispatchEvent(new Event('input', {bubbles: true}));
+                inp.dispatchEvent(new Event('change', {bubbles: true}));
+                inp.dispatchEvent(new Event('blur', {bubbles: true}));
+            };
+            setNative(rateInput, basePrice);
+            const wroteExtra = (extraInput && extraRate !== null && extraRate !== undefined);
+            if (wroteExtra) setNative(extraInput, extraRate);
+
+            // Open the dropdown. The cog button is the .dropdown-toggle inside
+            // the same .btn-group as the .glyphicon-cog icon.
+            const cogIcon = cogRow.querySelector('span.glyphicon-cog');
+            const cogBtn = cogIcon ? cogIcon.closest('button') : null;
+            if (!cogBtn) return {ok: false, error: 'cog button (parent of icon) not found'};
+            cogBtn.click();
+
+            return {
+                ok: true,
+                base: basePrice,
+                extra: wroteExtra ? extraRate : null,
+                extra_input_present: !!extraInput,
+            };
+        }""",
+        {"rowIndex": row_index, "basePrice": base_price, "extraRate": extra_rate},
+    )
+    if not open_result.get("ok"):
+        return open_result
+
+    # Let Angular render the dropdown items (the menu is empty in static
+    # HTML and populates on click — observed in captured estimate snapshot).
+    page.wait_for_timeout(400)
+
+    # Step 2: click the matching menu item by text. Whitespace-tolerant
+    # regex match per qchub-option-whitespace feedback memory.
+    pick_result = page.evaluate(
+        r"""({scopeLabel}) => {
+            const menus = Array.from(document.querySelectorAll('.dropdown-menu'));
+            const visibleMenu = menus.find(m => {
+                const r = m.getBoundingClientRect();
+                const st = window.getComputedStyle(m);
+                return r.width > 0 && r.height > 0
+                    && st.visibility !== 'hidden' && st.display !== 'none';
+            });
+            if (!visibleMenu) return {ok: false, error: 'no visible dropdown menu after cog click'};
+
+            const pattern = scopeLabel.split(/\s+/).map(w =>
+                w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+            ).join('\\s+');
+            const re = new RegExp(pattern, 'i');
+            const items = Array.from(visibleMenu.querySelectorAll('button, [role="menuitem"]'));
+            const target = items.find(it => re.test((it.textContent || '').trim()));
+            if (!target) {
+                return {
+                    ok: false,
+                    error: 'no menu item matched ' + JSON.stringify(scopeLabel),
+                    available: items.map(it => (it.textContent || '').trim()),
+                };
+            }
+            // If target is a wrapping <li>, click the inner button instead.
+            const clickTarget = target.tagName === 'BUTTON' ? target : (target.querySelector('button') || target);
+            clickTarget.click();
+            return {ok: true, picked: (clickTarget.textContent || '').trim()};
+        }""",
+        {"scopeLabel": scope_label},
+    )
+    if not pick_result.get("ok"):
+        # Try to close the now-orphaned dropdown so it doesn't block subsequent UI.
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        return pick_result
+
+    # Let qchub propagate the new rates through the rest of the rows.
+    page.wait_for_timeout(800)
+
+    return {
+        "ok": True,
+        "base": open_result.get("base"),
+        "extra": open_result.get("extra"),
+        "extra_input_present": open_result.get("extra_input_present", False),
+        "picked": pick_result.get("picked"),
+        "scope": scope,
+    }
 
 
 def _click_save_rates_if_present(page: Page, log: ProgressCallback) -> bool:
@@ -4554,6 +4838,28 @@ def _execute_edit_command(
             "line": _estimate_line_to_dict(lines[idx], idx),
         }
 
+    if cmd.kind == "apply_rate_via_cog":
+        idx = int(cmd.payload["line_index"])
+        price = float(cmd.payload["unit_price"])
+        extra = float(cmd.payload.get("extra_rate", 0.0))
+        scope = str(cmd.payload["scope"])
+        result = _apply_rate_via_cog(page, idx, price, extra, scope)
+        if not result.get("ok"):
+            err = result.get("error", "unknown")
+            avail = result.get("available")
+            avail_note = f" — available menu items: {avail}" if avail else ""
+            raise RuntimeError(f"cog apply failed (scope={scope}): {err}{avail_note}")
+        page.wait_for_timeout(400)
+        lines = _parse_estimate_rows_from_modal(modal)
+        return {
+            "scope": result.get("scope"),
+            "picked": result.get("picked"),
+            "set_base": price,
+            "set_extra": extra,
+            "extra_input_present": result.get("extra_input_present", False),
+            "lines": [_estimate_line_to_dict(L, i) for i, L in enumerate(lines)],
+        }
+
     if cmd.kind == "apply_rate_to_all":
         substr = str(cmd.payload["subtype_contains"]).lower()
         price = float(cmd.payload["unit_price"])
@@ -4601,12 +4907,21 @@ def _execute_edit_command(
 
 def _dispatch_edit_commands_until_done(
     context, page: Page, session: "QchubEditSession", order_id: Optional[str],
-    log: ProgressCallback, *, timeout_sec: int,
+    log: ProgressCallback, *, timeout_sec: int, initial_pdf_saved: bool = True,
 ) -> None:
     """Replaces the blocking `wait_for_event("close")`. Drains commands
     from `session.command_queue`, executes them on the live page, and
     exits when EITHER (a) the user closed the browser, or (b) the
     `timeout_sec` budget elapsed.
+
+    `initial_pdf_saved`: True if the initial _capture_estimate produced a
+    PDF (legacy `download_pdf=True` path). False if the initial capture
+    skipped the PDF (current default — user 2026-05-26 wanted ONE PDF in
+    Downloads, not v1+v2). Controls where the version counter starts so
+    Ellen's first recap is named correctly:
+      - True  → counter starts at 1; Ellen's first recap = v2 → `_v2` suffix
+      - False → counter starts at 0; Ellen's first recap = v1 → no suffix
+                (file becomes `Estimate_NNNNN.pdf`, the user's only PDF)
     """
     if order_id is None:
         # No order ID means no estimate modal — nothing for Ellen to edit.
@@ -4620,7 +4935,7 @@ def _dispatch_edit_commands_until_done(
             log(f"(post-ready wait ended: {type(exc).__name__}: {exc})")
         return
 
-    version_holder = [1]  # mutable counter so _execute_edit_command can bump
+    version_holder = [1 if initial_pdf_saved else 0]
     end_time = time.time() + timeout_sec
     log(
         f"Browser staying open up to {timeout_sec // 60} min "
