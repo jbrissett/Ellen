@@ -2046,6 +2046,12 @@ def _upload_kml(page: Page, kml_path: Path, log: ProgressCallback) -> None:
 
     qchub's importer expects `.kml`. UI button text is "UPLOAD KML".
     """
+    # Defensive: if the post-CREATE-GROUP Info Alert is STILL up at upload
+    # time (the post-create dismiss missed it, or it appeared late), clear
+    # it now or its overlay will block the UPLOAD KML button click. Quick
+    # 500ms probe — alert is either present and we dismiss, or it isn't
+    # and we skip. Established 2026-05-25 night Sarasota run.
+    _dismiss_info_alert(page, log, wait_ms=500)
     try:
         with page.expect_file_chooser(timeout=15_000) as fc_info:
             try:
@@ -2560,8 +2566,15 @@ def _drive_one_group(
             "Check the diagnostic page.html for which field qchub flagged."
         )
 
-    # The "Info Alert" pops up after the first group with a CONTINUE button.
-    _dismiss_info_alert(page, log)
+    # The "Info Alert" pops up after EACH group with a CONTINUE button.
+    # qchub renders it async after the server responds to CREATE GROUP, so
+    # the alert may not be visible at this exact instant — wait up to 6s
+    # for it to render before giving up. If we proceed to KML upload while
+    # the alert is mid-render, its overlay blocks the upload click and the
+    # bind never completes (Sarasota run 2026-05-25 night, 28-pin tube
+    # group). _upload_kml also calls _dismiss_info_alert defensively to
+    # catch any late-arriving alert that beats this wait.
+    _dismiss_info_alert(page, log, wait_ms=6_000)
 
     # Per John Goodwin's workflow: upload THIS group's KML while it's still
     # the active selection in qchub. qchub may auto-reopen the Add Study
@@ -3285,7 +3298,9 @@ def _fill_start_time_input(modal, value: str, log: ProgressCallback) -> bool:
     return False
 
 
-def _dismiss_info_alert(page: Page, log: ProgressCallback) -> None:
+def _dismiss_info_alert(
+    page: Page, log: ProgressCallback, *, wait_ms: int = 2_000,
+) -> None:
     """Dismiss the 'Now please, add at least one location…' Info Alert that
     qchub pops after CREATE GROUP and at other workflow checkpoints.
 
@@ -3294,12 +3309,21 @@ def _dismiss_info_alert(page: Page, log: ProgressCallback) -> None:
     `.first.is_visible()` check inspects a HIDDEN variant first, returns False,
     and we silently skip the click — leaving the real alert blocking the page.
     Scope the search to `div.modal.fade.in` to avoid that trap.
+
+    `wait_ms` controls how long we'll wait for the alert to BECOME visible
+    before giving up. Callers right after CREATE GROUP should pass a generous
+    value (~6000ms) because qchub's Angular renders the alert async after the
+    server responds; the default 2000ms is right for "alert is either there
+    now or never coming" checkpoints. Sized 6000ms after Sarasota
+    order-176597-adjacent run 2026-05-25 night: 28-pin TUBE group's alert
+    rendered AFTER the 2s post-CREATE-GROUP check, leaving the alert overlay
+    in place during KML upload — bind never completed, submit-gate timed out.
     """
     try:
         alert = page.locator("div.modal.fade.in").filter(
             has_text=re.compile(r"add\s+at\s+least\s+one\s+location", re.IGNORECASE)
         ).first
-        if alert.is_visible(timeout=2_000):
+        if alert.is_visible(timeout=wait_ms):
             alert.get_by_role("button", name=re.compile(r"^\s*continue\s*$", re.IGNORECASE)).first.click(timeout=3_000)
             log("Dismissed Info Alert.")
     except Exception:
