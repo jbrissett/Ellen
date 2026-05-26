@@ -259,6 +259,30 @@ def main() -> int:
     _set_status(splash, "Loading core modules…")
     from .app import MainWindow
 
+    # 4b. First-launch browser setup — `playwright install msedge`
+    # only runs once. Marker file at %LOCALAPPDATA%/TrafficIntake/
+    # .playwright_setup tracks completion. Skipped on every subsequent
+    # launch (fast file-existence check). When the installer ships
+    # Ellen, the .exe doesn't carry the browser binaries — this is
+    # the moment they get prepared.
+    from ..first_launch import (
+        playwright_browser_ready,
+        run_first_launch_setup_blocking,
+    )
+    if not playwright_browser_ready():
+        ok, err = run_first_launch_setup_blocking(
+            lambda msg: _set_status(splash, msg),
+        )
+        if not ok:
+            splash.close()
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.critical(
+                None, "Ellen — browser setup failed",
+                f"{err}\n\nEllen can't continue without browser support. "
+                "Resolve the issue above and re-launch.",
+            )
+            return 1
+
     _set_status(splash, "Building main window…")
     window = MainWindow()
 

@@ -3,3 +3,5 @@
 # Or just double-click tools\Run Regression Tests.bat (auto-installs on first run).
 
 pytest>=9.0.0
+pyinstaller>=6.20
+Pillow>=10.0
