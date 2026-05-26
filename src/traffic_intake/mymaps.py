@@ -520,7 +520,7 @@ def _import_per_group_layers(
             continue
 
         kml_result = kml_export.build_kml_for_locations(
-            g["locations"], layer_name=layer_name,
+            g["locations"], layer_name=layer_name, request=request,
         )
         log(
             f"  Layer {i}/{len(groups)} ({layer_name!r}): built KML with "

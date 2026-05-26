@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import config
+from .. import config, kmz as kmz_module, kmz_rediff
 from ..kml_export import build_kml, build_kmz
 from ..models import StudyRequest
 from ..mymaps import CreateMapResult
@@ -1083,6 +1083,16 @@ class MainWindow(QMainWindow):
             )
             return
 
+        # KMZ/KML re-drop fast path: when the user drops a KMZ that came
+        # FROM Ellen's own MyMaps export (detected via the ellen_loc_id
+        # ExtendedData marker) AND a StudyRequest is currently active,
+        # treat it as an edit-map re-drop instead of new-job extraction.
+        # Otherwise fall through to the existing email/KMZ extraction path
+        # so third-party KMZs (or new-job KMZs) keep working unchanged.
+        if path.suffix.lower() in (".kmz", ".kml") and self.extraction_panel.request() is not None:
+            if self._try_handle_kmz_rediff(path):
+                return
+
         self.status(f"Extracting {path.name}…")
         self.drop_zone.setBusy(True, f"Extracting {path.name}…")
         for b in (self.btn_map, self.btn_qchub, self.btn_email):
@@ -1136,6 +1146,116 @@ class MainWindow(QMainWindow):
         # shows.
         if self._has_api_key():
             self._fire_warmup_turn(request)
+
+    def _try_handle_kmz_rediff(self, path: Path) -> bool:
+        """If `path` is a re-drop of Ellen's exported MyMaps KMZ, apply the
+        unambiguous edits (coord moves, renames) directly to the active
+        StudyRequest and surface a chat turn for the rest. Returns True when
+        the file was handled as a rediff, False to fall through to extraction.
+        """
+        try:
+            data = path.read_bytes()
+            if path.suffix.lower() == ".kmz":
+                placemarks = kmz_module.parse_kmz_bytes(data)
+            else:  # .kml
+                placemarks = kmz_module.parse_kml_bytes(data)
+        except Exception as exc:
+            # Parse failure isn't a rediff — let the regular extraction
+            # pipeline complain about it instead of silently dropping the file.
+            self.status(f"Couldn't parse {path.name} as KMZ ({exc}); falling through.")
+            return False
+
+        if not kmz_rediff.is_rediff_candidate(placemarks):
+            # No ellen_loc_id markers — not from Ellen's export. Could be a
+            # third-party KMZ the user wants to attach; let extraction handle it.
+            return False
+
+        request = self.extraction_panel.request()
+        assert request is not None  # guarded by the call site
+        diff = kmz_rediff.compute_rediff(request, placemarks)
+
+        if not diff.has_changes:
+            self.chat_panel.appendSystemNote(
+                "Re-drop matched the active map exactly — no edits detected."
+            )
+            return True
+
+        # Apply the unambiguous edits in place. The display will refresh below.
+        moves, renames = kmz_rediff.apply_unambiguous(request, diff)
+        self.extraction_panel.setRequest(request)
+        self.status(
+            f"Applied {moves} move(s) and {renames} rename(s) from {path.name}."
+        )
+
+        # Build the rich human-facing detail block for Ellen's synthetic turn.
+        # She'll narrate it back to the user and ask about new/missing pins.
+        applied_lines: list[str] = []
+        for m in diff.moved:
+            applied_lines.append(
+                f"  - Location[{m.loc_id}] {m.site_name!r}: moved {m.distance_m:.0f}m "
+                f"(now at {m.new_lat:.5f},{m.new_lng:.5f})"
+            )
+        for r in diff.renamed:
+            applied_lines.append(
+                f"  - Location[{r.loc_id}]: renamed {r.old_name!r} → {r.new_name!r} "
+                "(applied to BOTH site_name and address_or_intersection)"
+            )
+        pending_lines: list[str] = []
+        for n in diff.new:
+            pending_lines.append(
+                f"  - NEW pin {n.name!r} at {n.latitude:.5f},{n.longitude:.5f} — "
+                "needs study_kind, subtype, time_windows, and group context "
+                "before add_locations"
+            )
+        for mp in diff.missing:
+            pending_lines.append(
+                f"  - REMOVED pin Location[{mp.loc_id}] {mp.site_name!r} — "
+                "confirm with user before calling remove_locations"
+            )
+
+        message_parts: list[str] = [
+            f"[SYSTEM] The user just dropped an edited KMZ ({path.name}). "
+            f"Re-drop diff: {moves} move(s), {renames} rename(s), "
+            f"{len(diff.new)} new pin(s), {len(diff.missing)} removed pin(s), "
+            f"{diff.unchanged_count} unchanged.",
+        ]
+        if applied_lines:
+            message_parts.append(
+                "Already applied to the StudyRequest (no action needed from you):"
+            )
+            message_parts.extend(applied_lines)
+        if pending_lines:
+            message_parts.append(
+                "Pending — please walk the user through these and apply via "
+                "add_locations / remove_locations after they respond:"
+            )
+            message_parts.extend(pending_lines)
+        else:
+            message_parts.append(
+                "No pending items. Acknowledge the edits and ask whether to "
+                "proceed with the qchub order."
+            )
+        message_parts.append(
+            "Keep your reply tight (under 8 lines). Don't dump the raw coords back "
+            "at the user — they just edited them. State what landed, then ask the "
+            "specific question for any pending items."
+        )
+
+        rediff_message = "\n".join(message_parts)
+        self.chat_panel.setBusy(True)
+        run_chat(
+            rediff_message,
+            self._chat_history,
+            request,
+            self._artifacts,
+            on_text_delta=self.chat_panel.appendAssistantDelta,
+            on_tool_result=self.chat_panel.appendToolResult,
+            on_action_request=self._on_chat_action_request,
+            on_finished=self._on_chat_finished,
+            on_failed=self._on_chat_failed,
+            qchub_edit_session=getattr(self, "_qchub_edit_session", None),
+        )
+        return True
 
     def _fire_warmup_turn(self, request: StudyRequest) -> None:
         """Fire a hidden first chat turn so Ellen's opening message is a

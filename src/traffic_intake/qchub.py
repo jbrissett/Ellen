@@ -2138,6 +2138,7 @@ def _add_study_groups(page: Page, request: StudyRequest, log: ProgressCallback) 
             kml_result = kml_export.build_kml_for_locations(
                 g["locations"],
                 layer_name=layer_name,
+                request=request,
             )
             kml_bytes: Optional[bytes] = kml_result.data
             log(
