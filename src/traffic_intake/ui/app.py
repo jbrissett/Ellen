@@ -119,12 +119,47 @@ class MainWindow(QMainWindow):
         # Right-click for native context menu (close, etc.) added later
         # if needed; left-click is the primary "bring me back" gesture.
         self._tray.activated.connect(self._on_tray_activated)
+        # Clicking the TOAST itself (not the tray icon) should also bring
+        # Ellen forward. Without this wiring, the toast was visual-only —
+        # user had to alt-tab manually after dismissing it. Established
+        # 2026-05-26: "clicking the notification does not bring ellen to
+        # the foreground."
+        self._tray.messageClicked.connect(self._bring_to_front)
         self._tray.show()
 
     def _on_tray_activated(self, reason) -> None:
         """Bring the main window forward when the user clicks the tray icon."""
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
             self._bring_to_front()
+
+    def _is_user_focused_on_us(self) -> bool:
+        """True iff the user is actively looking at our main window
+        right now. Used to gate non-urgent toast notifications so they
+        don't fire when the user is already watching the chat.
+
+        On Windows we ask the OS directly via GetForegroundWindow() —
+        Qt's isActiveWindow() and applicationState() both failed to
+        catch real-world "user is in another app" cases (verified
+        2026-05-26: both reported active when the user had alt-tabbed
+        to Outlook). The native HWND comparison matches what the user
+        actually sees.
+
+        Minimized window → not focused (regardless of HWND check).
+        Non-Windows → fall back to isActiveWindow().
+        """
+        if self.isMinimized():
+            return False
+        if sys.platform != "win32":
+            return self.isActiveWindow()
+        try:
+            import ctypes
+            fg_hwnd = ctypes.windll.user32.GetForegroundWindow()
+            our_hwnd = int(self.winId())
+            return fg_hwnd == our_hwnd
+        except Exception:
+            # ctypes / shell32 unavailable in an exotic environment —
+            # fall back to Qt's check.
+            return self.isActiveWindow()
 
     def _bring_to_front(self) -> None:
         """Raise + activate the main window, restoring from minimized
@@ -145,13 +180,36 @@ class MainWindow(QMainWindow):
         *,
         urgent: bool = False,
         timeout_ms: int = 5000,
+        always: bool = False,
     ) -> None:
         """Surface a Windows toast via the system tray icon. No-op if
         the tray isn't available. Always updates the status bar too so
         the info is visible without the toast.
+
+        Toast gating: by default the toast only fires when the main
+        window is UNFOCUSED. If the user is already looking at the
+        window they don't need an OS-level interruption; the chat
+        panel + status bar carry the same info. Set `always=True` to
+        force the toast (rare — used for genuinely-urgent failures
+        where we want attention even on the active window).
+        Established 2026-05-26 user direction: "toast on every
+        artifact-landed moment WHEN WINDOW UNFOCUSED."
         """
         self.status(message)
         if getattr(self, "_tray", None) is None:
+            return
+        # Urgent failures always toast — even if the window is active —
+        # so the user notices red-flag conditions. Non-urgent toasts
+        # only fire when the user isn't already watching our window.
+        # First attempt (2026-05-26 AM) used isActiveWindow() — fired
+        # toasts when user was already focused (Qt's "active window"
+        # is per-process, not per-OS-foreground). Second attempt used
+        # QApplication.applicationState() — still fired when focused
+        # (user-reported, 2026-05-26 PM). The reliable check on
+        # Windows is the OS-native GetForegroundWindow(): compare its
+        # returned HWND to our window's HWND. No Qt indirection,
+        # matches what the user actually sees.
+        if not always and not urgent and self._is_user_focused_on_us():
             return
         icon_kind = (
             QSystemTrayIcon.MessageIcon.Critical
@@ -566,6 +624,36 @@ class MainWindow(QMainWindow):
         current = self.extraction_panel.request()
         if current is not None:
             self.extraction_panel.setRequest(current)
+        # Notify when Ellen's turn produced a new estimate PDF version.
+        # Track the last-notified PDF path on self; when artifacts
+        # show a different one, the user has a fresh PDF in Downloads
+        # worth flagging. Established 2026-05-26: post-edit recap PDFs
+        # were silent, the user had to hunt for the new file in
+        # Downloads rather than getting a toast.
+        pdf_notified_this_turn = False
+        current_pdf = self._artifacts.get("estimate_pdf_path")
+        last_pdf = getattr(self, "_last_notified_pdf", None)
+        if current_pdf and current_pdf != last_pdf:
+            from pathlib import Path as _P
+            self.notify(
+                "Estimate PDF updated",
+                f"New version saved: {_P(current_pdf).name}. Open it in Downloads.",
+            )
+            self._last_notified_pdf = current_pdf
+            pdf_notified_this_turn = True
+
+        # Notify when Ellen ends her turn with a question / request for
+        # user input. Heuristic: the last assistant text ends with '?'
+        # (after stripping trailing whitespace). Same detection logic
+        # the floating-reply widget uses; this is the toast-equivalent
+        # while that widget is disabled. Skip if we already toasted for
+        # a new PDF in this same turn — one ping per turn is enough.
+        if not pdf_notified_this_turn:
+            last_text = self._extract_last_assistant_text().rstrip()
+            if last_text and last_text.endswith("?"):
+                # Trim to a one-liner toast preview.
+                preview = _shorten(last_text.split("\n")[-1].strip(), 140)
+                self.notify("Ellen has a question", preview)
         # If Ellen ended the session this turn (end_session tool fired),
         # drop our reference to the now-dead qchub edit session so the
         # NEXT chat turn doesn't pass it back to the worker.
@@ -1124,7 +1212,10 @@ class MainWindow(QMainWindow):
 
     def _on_email_draft_finished(self, result) -> None:
         self.btn_email.setEnabled(True)
-        self.status(f"Outlook draft opened: To {result.to}.")
+        self.notify(
+            "Email draft ready",
+            f"Outlook draft opened — to {result.to}. Review and click Send when ready.",
+        )
         body = (
             f"Outlook draft opened — review and click <b>Send</b> when ready.<br/>"
             f"&nbsp;&nbsp;<b>To:</b> {result.to}<br/>"
@@ -1262,7 +1353,16 @@ class MainWindow(QMainWindow):
         # enables its buttons below.
         self.extraction_panel.setRequest(request)
         n = request.total_locations
-        self.status(f"Extracted {n} location{'s' if n != 1 else ''} from {request.email_subject!r}.")
+        subj_short = _shorten(request.email_subject or "(no subject)", 60)
+        # "Pre-run done" framing per user direction 2026-05-26 — the
+        # toast lands the moment extraction + geocoding completes (this
+        # IS the pre-run). Ellen's warmup summary follows ~10s later;
+        # if she ends with a question, the chat-finished handler fires
+        # its own "Ellen has a question" toast.
+        self.notify(
+            "Pre-run done",
+            f"{n} location{'s' if n != 1 else ''} extracted from {subj_short!r}. Ready for review.",
+        )
         for b in (self.btn_map, self.btn_qchub, self.btn_email):
             b.setEnabled(True)
         self.act_export_kmz.setEnabled(True)
