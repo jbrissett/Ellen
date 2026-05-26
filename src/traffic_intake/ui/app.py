@@ -290,29 +290,47 @@ class MainWindow(QMainWindow):
         return self.size()
 
     def _build_central(self) -> None:
-        # Left pane: drop zone + extraction panel + actions (existing UI)
+        # Layout refactored 2026-05-26 per user direction: kill the bulky
+        # 3-tab extraction inspector (Summary / Locations / JSON) — same
+        # data is reachable via Ellen's tools, and the tabs were crowding
+        # the chat. New shape is a thin fixed-width left column + chat
+        # dominating the right.
+        #
+        # Left column (~320px):
+        #   * DropZone — taller than before since the tabs are gone;
+        #     visually communicates "big drop target" without claiming the
+        #     whole window. Window-wide drop forwarding (MainWindow.dropEvent
+        #     -> drop_zone) still lets you drop ANYWHERE including the chat.
+        #   * Compact StatusSummary strip — one paragraph: project, location
+        #     count, geocoding confidence, warnings.
+        #   * Action buttons stacked VERTICALLY (the column is narrow).
+        #
+        # Right column: chat panel takes all remaining space.
         left = QWidget()
+        # HARD CAP the left strip's width. Wide action-button labels
+        # ("Create MyMaps map…") were forcing the splitter to give the
+        # column ~half the window. Capping at 260px keeps the chat
+        # dominant regardless of child size hints. User can still drag
+        # the splitter wider if they really want to.
+        left.setMaximumWidth(260)
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(8, 8, 8, 8)
+        left_layout.setSpacing(8)
 
         self.drop_zone = DropZone()
         self.drop_zone.fileDropped.connect(self.on_file_dropped)
         self.drop_zone.diagnosticMessage.connect(self.status)
+        # Drop zone takes most of the vertical room — "big drop target" was
+        # explicit user direction. stretch=1 with no competing stretchers
+        # below means it absorbs all remaining vertical space.
         left_layout.addWidget(self.drop_zone, 1)
 
-        # Extraction panel and action row are ALWAYS visible. Their empty
-        # states (extraction_panel shows an italic "Drop an email above"
-        # placeholder; action_row shows three disabled buttons) carry zero
-        # confusion. Previously these were `setVisible(False)` at startup
-        # and toggled True on extraction-finished — but that toggle made
-        # the layout's preferred size jump, which made Qt reshape the
-        # window. Per user direction 2026-05-25: window sizing is a USER
-        # action only.
+        # Compact status replaces the tabs. Same setRequest/request API.
         self.extraction_panel = ExtractionPanel()
-        left_layout.addWidget(self.extraction_panel, 2)
+        left_layout.addWidget(self.extraction_panel, 0)
 
         self.action_row = self._build_action_row()
-        left_layout.addWidget(self.action_row)
+        left_layout.addWidget(self.action_row, 0)
 
         # Right pane: chat sidebar (persistent — always visible)
         self.chat_panel = ChatPanel()
@@ -321,9 +339,15 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(left)
         splitter.addWidget(self.chat_panel)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        splitter.setSizes([900, 600])
+        # Left column: pinned narrow so the chat dominates. setStretchFactor
+        # 0:1 means the LEFT keeps its size hint and the chat eats every
+        # extra pixel of window width. Users can still drag the splitter to
+        # widen the left if they want; the default is chat-heavy.
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([240, 1160])
+        splitter.setCollapsible(0, False)
+        splitter.setCollapsible(1, False)
 
         # Belt-and-suspenders: tell the splitter "don't push your sizeHint
         # up to the window." Combined with sizeHint() override above, this
@@ -335,19 +359,31 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(splitter)
 
     def _build_action_row(self) -> QWidget:
+        # Compact icon row — three small buttons that fit horizontally in
+        # the narrow (260px) left strip. Glyphs are Unicode pictographs
+        # rendered with the system's color-emoji font (Windows 11 ships
+        # Segoe UI Emoji). Tooltips carry the full action labels for
+        # discoverability; the visible glyph is the "small icon" the user
+        # asked for 2026-05-26.
         row = QWidget()
         layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
 
-        self.btn_map = QPushButton("Create MyMaps map…")
-        self.btn_map.setEnabled(False)
-        self.btn_map.clicked.connect(self.on_create_map)
-        self.btn_qchub = QPushButton("Create qchub order…")
-        self.btn_qchub.setEnabled(False)
-        self.btn_qchub.clicked.connect(self.on_create_qchub_order)
-        self.btn_email = QPushButton("Draft response email…")
-        self.btn_email.setEnabled(False)
-        self.btn_email.clicked.connect(self.on_draft_email)
+        def _icon_btn(glyph: str, tooltip: str, handler) -> QPushButton:
+            btn = QPushButton(glyph)
+            btn.setToolTip(tooltip)
+            btn.setEnabled(False)
+            btn.setFixedSize(56, 40)
+            f = btn.font()
+            f.setPointSize(16)
+            btn.setFont(f)
+            btn.clicked.connect(handler)
+            return btn
+
+        self.btn_map = _icon_btn("🗺", "Create MyMaps map", self.on_create_map)
+        self.btn_qchub = _icon_btn("📋", "Create qchub order", self.on_create_qchub_order)
+        self.btn_email = _icon_btn("✉", "Draft response email", self.on_draft_email)
         layout.addWidget(self.btn_map)
         layout.addWidget(self.btn_qchub)
         layout.addWidget(self.btn_email)
@@ -653,6 +689,10 @@ class MainWindow(QMainWindow):
                 settings.setValue("skip_qchub_confirm", True)
 
         self.btn_qchub.setEnabled(False)
+        # Reset the progress-forwarding gate so this new run's pre-ready
+        # log messages reach drop_zone busy state. _on_qchub_finished will
+        # set this back to True when the order submits.
+        self._qchub_ready_emitted = False
         self.drop_zone.setBusy(True, "Creating qchub order (browser window opening)…")
         self.status("Creating qchub order…")
         run_qchub_creation(
@@ -667,9 +707,22 @@ class MainWindow(QMainWindow):
 
     def _on_qchub_progress(self, message: str) -> None:
         self.status(message)
-        self.drop_zone.setBusy(True, message)
+        # Stop re-busying the drop_zone after the order is ready. The qchub
+        # worker keeps logging through the post-submit manual-finish window
+        # (every edit-session call, the eventual "End-session requested by
+        # Ellen — closing qchub browser") and each log fired this callback,
+        # re-setting drop_zone status. When end_session triggered the worker
+        # to exit, the LAST log line ("End-session requested...") stayed
+        # pinned in the busy state with no finalize signal to clear it.
+        # Fix: only forward to drop_zone busy state UNTIL the order is
+        # marked ready; subsequent logs go to the status bar only.
+        # Established 2026-05-26 user report: drop_zone stuck on
+        # "End-session/closing qchub" after qchub had already closed.
+        if not getattr(self, "_qchub_ready_emitted", False):
+            self.drop_zone.setBusy(True, message)
 
     def _on_qchub_finished(self, result: CreateOrderResult) -> None:
+        self._qchub_ready_emitted = True
         self.btn_qchub.setEnabled(True)
         self.drop_zone.setBusy(False)
         self.status(f"qchub order created (id={result.order_id or 'unknown'}).")

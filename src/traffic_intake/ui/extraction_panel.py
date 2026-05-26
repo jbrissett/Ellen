@@ -1,221 +1,142 @@
-"""Tabbed view that shows an extracted StudyRequest — summary, locations grid,
-and raw JSON. Editable in the locations grid (site name, study kind, subtype).
+"""Compact status summary for the extracted StudyRequest.
+
+Refactored 2026-05-26 from a 3-tab inspector (Summary / Locations / JSON)
+to a single compact status block. The tabs were dead weight — the same
+data is accessible via Ellen's tools (`get_request`, `list_locations`,
+`get_kmz_placemarks`), and they crowded the chat. The widget retains
+the public API (`setRequest`, `request`, `requestChanged`) so the rest
+of the app continues to work unchanged.
+
+Renders when a StudyRequest is loaded:
+  Project 2026-32 — Zephyrhills, FL
+  4 locations (4 TMC) · 1 high, 3 medium confidence
+  ⚠ 2 need verification
+
+Empty state: italic "No email loaded · drop one to begin".
 """
 from __future__ import annotations
 
-import json
 from typing import Optional
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import (
-    QComboBox,
-    QHeaderView,
-    QLabel,
-    QPlainTextEdit,
-    QTableWidget,
-    QTableWidgetItem,
-    QTabWidget,
-    QTextEdit,
-    QVBoxLayout,
-    QWidget,
-)
+from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
 
-from ..models import StudyKind, StudyRequest, TMCSubtype, TubeSubtype
+from ..models import StudyKind, StudyRequest
 
 
 class ExtractionPanel(QWidget):
-    requestChanged = Signal(object)  # emitted when user edits anything
+    requestChanged = Signal(object)  # kept for back-compat; not emitted today
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self._request: Optional[StudyRequest] = None
 
         layout = QVBoxLayout(self)
-        self.tabs = QTabWidget()
-        layout.addWidget(self.tabs)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(4)
 
-        self.summary_view = QTextEdit()
-        self.summary_view.setReadOnly(True)
-        self.tabs.addTab(self.summary_view, "Summary")
+        self.label = QLabel()
+        self.label.setWordWrap(True)
+        self.label.setTextFormat(Qt.TextFormat.RichText)
+        # Match the chat panel's slightly larger font for legibility.
+        f = self.label.font()
+        f.setPointSize(11)
+        self.label.setFont(f)
+        layout.addWidget(self.label)
 
-        self.locations_table = QTableWidget()
-        self.locations_table.setColumnCount(8)
-        self.locations_table.setHorizontalHeaderLabels(
-            ["#", "Site name", "Kind", "Subtype", "Times", "Conf.", "Lat", "Lon"]
+        # Soft background so the strip is visually distinct from drop_zone
+        # above and the action buttons below.
+        self.setObjectName("status_summary")
+        self.setStyleSheet(
+            "#status_summary { background: #f3f4f6; border: 1px solid #e2e4e7; "
+            "border-radius: 6px; }"
         )
-        self.locations_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-        self.locations_table.horizontalHeader().setStretchLastSection(False)
-        self.locations_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.locations_table.cellChanged.connect(self._on_cell_changed)
-        self.tabs.addTab(self.locations_table, "Locations")
 
-        self.json_view = QPlainTextEdit()
-        self.json_view.setReadOnly(True)
-        font = self.json_view.font()
-        font.setFamily("Consolas")
-        self.json_view.setFont(font)
-        self.tabs.addTab(self.json_view, "Raw JSON")
-
-        self.empty_label = QLabel("Drop an email above to begin.")
-        self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.empty_label.setStyleSheet("color: #999; font-style: italic; padding: 24px;")
-        layout.addWidget(self.empty_label)
-        self.tabs.setVisible(False)
+        self.setRequest(None)
 
     def setRequest(self, request: Optional[StudyRequest]) -> None:
         self._request = request
         if request is None:
-            self.tabs.setVisible(False)
-            self.empty_label.setVisible(True)
+            self.label.setText(
+                "<span style='color:#888; font-style:italic;'>"
+                "No email loaded — drop an .eml to begin."
+                "</span>"
+            )
             return
-        self.empty_label.setVisible(False)
-        self.tabs.setVisible(True)
-        self._populate_summary(request)
-        self._populate_locations(request)
-        self._populate_json(request)
+        self.label.setText(self._render(request))
 
     def request(self) -> Optional[StudyRequest]:
         return self._request
 
-    def _populate_summary(self, r: StudyRequest) -> None:
+    def _render(self, r: StudyRequest) -> str:
+        title_bits: list[str] = []
+        if r.client_project_number:
+            title_bits.append(_esc(f"#{r.client_project_number}"))
+        if r.jurisdiction:
+            title_bits.append(_esc(r.jurisdiction))
+        if not title_bits and r.email_subject:
+            title_bits.append(_esc(_shorten(r.email_subject, 70)))
+        title = " — ".join(title_bits) if title_bits else "(no project info)"
+
+        # Location breakdown by study kind.
+        n_total = len(r.locations)
+        by_kind: dict[str, int] = {}
+        for loc in r.locations:
+            label = (
+                "TMC" if loc.study_kind == StudyKind.TURNING_MOVEMENT
+                else "tube" if loc.study_kind == StudyKind.TUBE
+                else "survey"
+            )
+            by_kind[label] = by_kind.get(label, 0) + 1
+        kind_bits = " + ".join(f"{n} {k}" for k, n in by_kind.items())
+        loc_line = f"{n_total} location{'' if n_total == 1 else 's'}"
+        if kind_bits:
+            loc_line += f" ({kind_bits})"
+
+        # Geocoding confidence summary.
+        n_high = sum(1 for l in r.locations if l.estimate and l.estimate.confidence == "high")
+        n_med = sum(1 for l in r.locations if l.estimate and l.estimate.confidence == "medium")
+        n_low = sum(1 for l in r.locations if l.estimate and l.estimate.confidence == "low")
+        n_none = sum(1 for l in r.locations if l.estimate is None)
+        conf_bits: list[str] = []
+        if n_high:
+            conf_bits.append(f"{n_high} high")
+        if n_med:
+            conf_bits.append(f"{n_med} medium")
+        if n_low:
+            conf_bits.append(f"{n_low} low")
+        if n_none:
+            conf_bits.append(f"{n_none} no coords")
+        conf_line = ", ".join(conf_bits) if conf_bits else "no geocoding"
+
+        # Quick warnings.
+        warnings: list[str] = []
+        if n_low or n_none:
+            warnings.append(
+                f"⚠ {n_low + n_none} need verification on the map"
+            )
         flagged_windows = sum(
             1 for loc in r.locations for tw in loc.time_windows if tw.flag
         )
-        flags_html = ""
         if flagged_windows:
-            flags_html = (
-                f'<p style="color:#a00;"><b>⚠ {flagged_windows} time window(s) flagged</b> — '
-                f"review on Locations tab before proceeding.</p>"
+            warnings.append(f"⚠ {flagged_windows} time window(s) flagged")
+
+        parts = [
+            f"<div style='font-weight:600;'>{title}</div>",
+            f"<div style='color:#444; margin-top:2px;'>{_esc(loc_line)}</div>",
+            f"<div style='color:#666; font-size:10pt;'>{_esc(conf_line)}</div>",
+        ]
+        for w in warnings:
+            parts.append(
+                f"<div style='color:#a40000; margin-top:3px;'>{_esc(w)}</div>"
             )
-
-        unplaced = sum(1 for loc in r.locations if loc.estimate is None)
-        unplaced_html = ""
-        if unplaced:
-            unplaced_html = (
-                f'<p style="color:#a60;"><b>⚠ {unplaced} location(s) without coordinates</b> — '
-                f"will need manual pinning on the map.</p>"
-            )
-
-        attach_bits = []
-        if r.has_kmz_attachment:
-            attach_bits.append("KMZ (used for coordinates)")
-        if r.has_aerial_image:
-            attach_bits.append("aerial image (used for vision-based location)")
-        attach_line = ", ".join(attach_bits) or "none"
-
-        html = f"""
-        <h2 style="margin:0;">{_esc(r.email_subject)}</h2>
-        <p style="color:#666; margin-top:2px;">From {_esc(r.email_from)} &nbsp;·&nbsp; {r.email_date.isoformat() if r.email_date else ''}</p>
-        {flags_html}
-        {unplaced_html}
-        <table cellpadding="4" cellspacing="0">
-          <tr><td style="color:#666;">Client:</td><td>{_esc(r.client_company or '—')}</td></tr>
-          <tr><td style="color:#666;">Contact:</td><td>{_esc(r.client_contact_name or '—')} &lt;{_esc(r.client_contact_email or '—')}&gt;</td></tr>
-          <tr><td style="color:#666;">Project #:</td><td>{_esc(r.client_project_number or '—')}</td></tr>
-          <tr><td style="color:#666;">Jurisdiction:</td><td>{_esc(r.jurisdiction or '—')}</td></tr>
-          <tr><td style="color:#666;">Locations:</td><td>{r.total_locations}</td></tr>
-          <tr><td style="color:#666;">Attachments used:</td><td>{_esc(attach_line)}</td></tr>
-        </table>
-        <h3>Notes</h3>
-        <div style="white-space: pre-wrap;">{_esc(r.notes or '(none)')}</div>
-        """
-        self.summary_view.setHtml(html)
-
-    def _populate_locations(self, r: StudyRequest) -> None:
-        self.locations_table.blockSignals(True)
-        self.locations_table.setRowCount(len(r.locations))
-        for row, loc in enumerate(r.locations):
-            self.locations_table.setItem(row, 0, _readonly(str(row + 1)))
-
-            name_item = QTableWidgetItem(loc.site_name)
-            self.locations_table.setItem(row, 1, name_item)
-
-            kind_combo = QComboBox()
-            for k in StudyKind:
-                kind_combo.addItem(k.value, k)
-            kind_combo.setCurrentText(loc.study_kind.value)
-            kind_combo.currentTextChanged.connect(lambda v, ridx=row: self._on_kind_changed(ridx, v))
-            self.locations_table.setCellWidget(row, 2, kind_combo)
-
-            self._set_subtype_widget(row, loc)
-
-            times_text = ", ".join(
-                (f"{tw.label}: {tw.start}–{tw.end}" + (" ⚠" if tw.flag else ""))
-                for tw in loc.time_windows
-            )
-            self.locations_table.setItem(row, 4, _readonly(times_text))
-
-            est = loc.estimate
-            if est is None:
-                conf = "(none)"
-                lat_s = lon_s = "—"
-            else:
-                conf = f"{est.confidence} ({est.source})"
-                lat_s = f"{est.latitude:.5f}"
-                lon_s = f"{est.longitude:.5f}"
-            self.locations_table.setItem(row, 5, _readonly(conf))
-            self.locations_table.setItem(row, 6, _readonly(lat_s))
-            self.locations_table.setItem(row, 7, _readonly(lon_s))
-
-        self.locations_table.resizeColumnsToContents()
-        self.locations_table.blockSignals(False)
-
-    def _set_subtype_widget(self, row: int, loc) -> None:
-        combo = QComboBox()
-        if loc.study_kind == StudyKind.TURNING_MOVEMENT:
-            for v in TMCSubtype:
-                combo.addItem(v.value, v)
-            combo.setCurrentText((loc.tmc_subtype or TMCSubtype.STANDARD).value)
-        else:
-            for v in TubeSubtype:
-                combo.addItem(v.value, v)
-            combo.setCurrentText((loc.tube_subtype or TubeSubtype.VOLUME).value)
-        combo.currentTextChanged.connect(lambda v, ridx=row: self._on_subtype_changed(ridx, v))
-        self.locations_table.setCellWidget(row, 3, combo)
-
-    def _populate_json(self, r: StudyRequest) -> None:
-        self.json_view.setPlainText(json.dumps(r.model_dump(mode="json"), indent=2, default=str))
-
-    def _on_cell_changed(self, row: int, col: int) -> None:
-        if self._request is None or col != 1:  # only site_name is text-editable
-            return
-        new = self.locations_table.item(row, col).text()
-        self._request.locations[row].site_name = new
-        self._populate_json(self._request)
-        self.requestChanged.emit(self._request)
-
-    def _on_kind_changed(self, row: int, value: str) -> None:
-        if self._request is None:
-            return
-        loc = self._request.locations[row]
-        loc.study_kind = StudyKind(value)
-        if loc.study_kind == StudyKind.TURNING_MOVEMENT:
-            loc.tube_subtype = None
-            loc.tmc_subtype = loc.tmc_subtype or TMCSubtype.STANDARD
-        else:
-            loc.tmc_subtype = None
-            loc.tube_subtype = loc.tube_subtype or TubeSubtype.VOLUME
-        self._set_subtype_widget(row, loc)
-        self._populate_json(self._request)
-        self.requestChanged.emit(self._request)
-
-    def _on_subtype_changed(self, row: int, value: str) -> None:
-        if self._request is None:
-            return
-        loc = self._request.locations[row]
-        if loc.study_kind == StudyKind.TURNING_MOVEMENT:
-            loc.tmc_subtype = TMCSubtype(value)
-        else:
-            loc.tube_subtype = TubeSubtype(value)
-        self._populate_json(self._request)
-        self.requestChanged.emit(self._request)
-
-
-def _readonly(text: str) -> QTableWidgetItem:
-    item = QTableWidgetItem(text)
-    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-    return item
+        return "".join(parts)
 
 
 def _esc(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _shorten(s: str, n: int) -> str:
+    s = s.strip()
+    return s if len(s) <= n else s[: n - 1].rstrip() + "…"
