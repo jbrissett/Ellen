@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QRunnable, QSettings, QThreadPool, Signal
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
 
 from ..chat import DEFAULT_MODEL_PREFERENCE, resolve_model_chain, run_chat_turn
 from ..email_draft import DraftResult, EmailDraftError, draft_reply
@@ -255,12 +255,12 @@ class ChatWorker(QRunnable):
 
     def run(self) -> None:
         try:
-            # User-selected chat model (set via Settings dialog). Defaults to
-            # 'auto' = Sonnet → Opus → Haiku fallback chain. Read fresh each
-            # turn so changes in Settings take effect on the next message.
-            settings = QSettings("Quality Counts", "Traffic Intake")
-            preference = str(settings.value("chat_model", DEFAULT_MODEL_PREFERENCE))
-            chain = resolve_model_chain(preference)
+            # Chat model is fixed to the DEFAULT_MODEL_PREFERENCE chain
+            # ("auto" = Sonnet → Opus → Haiku fallback). User-facing
+            # toggle removed 2026-05-26 — "auto" handles Anthropic
+            # overload outages correctly and there's no user case for
+            # forcing a single model.
+            chain = resolve_model_chain(DEFAULT_MODEL_PREFERENCE)
 
             new_history = run_chat_turn(
                 self.user_message,
