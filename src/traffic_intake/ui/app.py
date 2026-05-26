@@ -602,6 +602,7 @@ class MainWindow(QMainWindow):
         # worth flagging. Established 2026-05-26: post-edit recap PDFs
         # were silent, the user had to hunt for the new file in
         # Downloads rather than getting a toast.
+        pdf_notified_this_turn = False
         current_pdf = self._artifacts.get("estimate_pdf_path")
         last_pdf = getattr(self, "_last_notified_pdf", None)
         if current_pdf and current_pdf != last_pdf:
@@ -611,6 +612,20 @@ class MainWindow(QMainWindow):
                 f"New version saved: {_P(current_pdf).name}. Open it in Downloads.",
             )
             self._last_notified_pdf = current_pdf
+            pdf_notified_this_turn = True
+
+        # Notify when Ellen ends her turn with a question / request for
+        # user input. Heuristic: the last assistant text ends with '?'
+        # (after stripping trailing whitespace). Same detection logic
+        # the floating-reply widget uses; this is the toast-equivalent
+        # while that widget is disabled. Skip if we already toasted for
+        # a new PDF in this same turn — one ping per turn is enough.
+        if not pdf_notified_this_turn:
+            last_text = self._extract_last_assistant_text().rstrip()
+            if last_text and last_text.endswith("?"):
+                # Trim to a one-liner toast preview.
+                preview = _shorten(last_text.split("\n")[-1].strip(), 140)
+                self.notify("Ellen has a question", preview)
         # If Ellen ended the session this turn (end_session tool fired),
         # drop our reference to the now-dead qchub edit session so the
         # NEXT chat turn doesn't pass it back to the worker.
@@ -1311,9 +1326,14 @@ class MainWindow(QMainWindow):
         self.extraction_panel.setRequest(request)
         n = request.total_locations
         subj_short = _shorten(request.email_subject or "(no subject)", 60)
+        # "Pre-run done" framing per user direction 2026-05-26 — the
+        # toast lands the moment extraction + geocoding completes (this
+        # IS the pre-run). Ellen's warmup summary follows ~10s later;
+        # if she ends with a question, the chat-finished handler fires
+        # its own "Ellen has a question" toast.
         self.notify(
-            "Email extracted",
-            f"{n} location{'s' if n != 1 else ''} parsed from {subj_short!r}. Ellen's about to summarize.",
+            "Pre-run done",
+            f"{n} location{'s' if n != 1 else ''} extracted from {subj_short!r}. Ready for review.",
         )
         for b in (self.btn_map, self.btn_qchub, self.btn_email):
             b.setEnabled(True)
