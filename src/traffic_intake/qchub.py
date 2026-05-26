@@ -994,6 +994,19 @@ def _run(
             elif estimate:
                 note_parts.append("Estimate captured (no lines parsed — see HTML).")
             note_parts.append("Browser left open for verification.")
+            # Positive signal: estimate modal is OPEN now and edit tools work.
+            # Surfaced here so Ellen has unambiguous proof state rather than
+            # hedging with "I'll do it when the modal is live" (which is
+            # always a hallucination at this point — the modal IS live, that's
+            # what "Estimate captured" means). Observed run-20260526-113813:
+            # Ellen waited for "modal to be live" 60s+ after this note posted.
+            note_parts.append(
+                "Estimate modal is OPEN — edit tools (set_estimate_subtype, "
+                "set_estimate_rate, apply_rate_to_*, re_capture_estimate) are "
+                "live RIGHT NOW. Apply any pending pre-submit instructions in "
+                "your VERY NEXT response — do not wait, do not say 'when the "
+                "modal is up'."
+            )
             note = " ".join(note_parts)
         else:
             note = "Submit clicked but order ID wasn't captured. Verify in the browser."

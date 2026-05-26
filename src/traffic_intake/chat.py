@@ -1141,16 +1141,26 @@ Acknowledge once briefly ("got it" / "all set" / "great") and call `end_session`
 
 This pattern eliminates the "Ellen ran the estimate, ignored my pricing/subtype correction, then I had to ask again" loop. Capture and apply, don't capture and forget. Also catches the case flagged 2026-05-25 where the user said "make the roundabout Complex" pre-submit and Ellen acknowledged but didn't apply it — that's a pending subtype instruction the same way "$400 flat" is a pending pricing instruction.
 
-**BATCH MULTI-ROW ESTIMATE EDITS — ONE re_capture per user request, not per row.** When the user asks for any change that affects multiple rows ("all 4 are Large", "set TMCs to $400 each", "the three roundabouts are Complex"):
-1. Fire ALL the `set_estimate_subtype` / `set_estimate_rate` calls in the SAME response (parallel tool calls — the runtime executes them concurrently).
-2. THEN, in the NEXT response after the per-row tool results come back, call `re_capture_estimate` exactly ONCE to refresh the PDF.
-3. Report once with the close prompt ("All 4 TMC rows set to Large, updated PDF saved as _v2. Anything else?").
+**BATCH MULTI-ROW ESTIMATE EDITS — edit tools NO LONGER auto-recap. You MUST call re_capture_estimate explicitly after your batch.** (Auto-recap was removed 2026-05-26 morning after repeated per-row recap incidents — it forced sequential behavior because each edit call blocked 18s waiting for its chained recap.) Every edit-tool response now includes `"pdf_state": "STALE"` as a visible reminder.
 
-Do NOT call `re_capture_estimate` between per-row edits in the same logical batch. Each recap costs ~17 seconds + creates a redundant PDF file in Downloads. Observed 2026-05-25 estimate 176596: Ellen made 4 `set_estimate_subtype` calls + 4 `re_capture` calls + a stray reset apply_rate, producing v2.pdf through v6.pdf in ~80s when a single batch + single recap would have done it in ~20s with one clean _v2.pdf. The user explicitly flagged this as inefficient.
+**Pattern for ANY request that touches estimate rows:**
 
-When a SUBSEQUENT user request asks for ANOTHER multi-row edit (separate turn, separate intent), repeat the same pattern: batch the per-row calls, single recap, single report. Multiple distinct user requests = multiple batches = multiple recaps. ONE request = ONE batch = ONE recap, regardless of how many rows it touches.
+1. **Fire ALL the edit calls in the SAME response** (parallel tool calls — the runtime executes them concurrently). This works for any mix: `set_estimate_subtype`, `set_estimate_rate`, `apply_rate_to_location`, `apply_rate_to_all_locations`, etc. Edit tools now return in ~1s each so parallelism is real and visible.
 
-Single-row edits are an obvious special case: ONE set_subtype + ONE recap is still the right pattern (the batch happens to have size 1).
+2. **In your NEXT response, call `re_capture_estimate` exactly ONCE** (after all the parallel tool results have come back). This is THE recap that refreshes the PDF — without it, the saved PDF still shows the pre-edit state.
+
+3. **Report with the close prompt** ("All 4 TMC rows set to Large, updated PDF saved as _v2. Anything else?").
+
+**Pitfalls to avoid:**
+- Do NOT call `re_capture_estimate` between per-row edits in the same logical batch.
+- Do NOT skip `re_capture_estimate` — every batch ends with one, no exceptions.
+- Do NOT fire edits one-at-a-time across multiple responses when they're one user request — that's the pattern that caused the run-20260525-212237 + run-20260526-113813 problems.
+
+**Single-row edits**: ONE edit + ONE recap in the same two-response pattern. The batch happens to have size 1; the recap is still mandatory.
+
+**MULTIPLE distinct user requests** (separate turns, separate intent): each gets its own batch + recap cycle. ONE request = ONE batch = ONE recap, no matter how many rows it touches.
+
+**ESTIMATE MODAL IS OPEN AS SOON AS THE "Order N submitted" CONFIRMATION POSTS.** The qchub run-action's completion note explicitly says "Estimate modal is OPEN" — that's a hard signal, not a hint. Do NOT say "I'll apply this when the modal is live" — by the time you're reading the order-submitted note, the modal IS live by definition. The qchub_edit_session is wired and tools work. **Apply any pending pre-submit instructions in your VERY NEXT response, not in some future "when the modal comes up" turn.** Observed 2026-05-26 run-20260526-113813: Ellen said "I'll flip line 9 to Complex when the modal is live" 60+ seconds after the modal was live — that's a hallucination of state. Don't repeat it.
 
 **MyMaps result check**: when the user asks about the map link or you reference a map you created, ALWAYS call `get_artifacts` first. If `mymaps_failed=True`, tell the user the map failed (use the `mymaps_error` message) and ask whether to retry or export a KMZ instead. If `mymaps_share_url` is set, that's the link. If neither is set and `mymaps_in_progress=True`, the map is still being built — tell the user to give it a moment and check back. Never tell the user to "check the MyMaps tab" — artifacts is the source of truth.
 
@@ -1467,25 +1477,25 @@ def execute_tool(
                     # line_number is 1-based (qchub UI); internal API is 0-based.
                     result = qchub_edit_session.list_subtype_options(int(args["line_number"]) - 1)
                     return json.dumps(_scrub_dollars_from_estimate_result(result), indent=2)
-                # The three edit tools (set_estimate_subtype,
-                # set_estimate_rate, apply_estimate_rate_to_all_matching)
-                # automatically chain a re_capture so the PDF in
-                # Downloads is always fresh after Ellen makes a change.
-                # Without this, Ellen routinely "applies $400 to all
-                # rows" and then stops — leaving a stale PDF the user
-                # opens expecting updated numbers (observed
-                # run-20260524-232317). The auto-recap is coalesced via
-                # `_auto_recapture` so a burst of parallel edits collapses
-                # to ONE PDF write (run-20260525-212237: 4 edits ->
-                # v2/v3/v4/v5 PDFs in ~80s; with coalesce: 1 PDF, ~20s).
+                # Edit tools DO NOT auto-recap. Removed 2026-05-26 morning
+                # after run-20260526-113813 showed Ellen's per-row recap
+                # pattern persisting despite the 4s coalesce: she waits for
+                # the auto-chained recap to return before issuing the next
+                # edit, defeating any parallel-call benefit. Edit tools now
+                # return in ~1s; Ellen MUST explicitly call re_capture_estimate
+                # after her batch (single tool call) to refresh the PDF.
+                # The "BATCH MULTI-ROW ESTIMATE EDITS" rule in the system
+                # prompt is now load-bearing. Edit responses include
+                # `pdf_state: "STALE"` as a visible reminder.
+                _STALE = {"pdf_state": "STALE — call re_capture_estimate after your batch to refresh the PDF"}
+
                 if name == "set_estimate_subtype":
                     # line_number is 1-based (qchub UI); internal API is 0-based.
                     edit = qchub_edit_session.set_subtype(
                         int(args["line_number"]) - 1, str(args["subtype"]),
                     )
-                    recap = _auto_recapture(qchub_edit_session)
                     return json.dumps(_scrub_dollars_from_estimate_result(
-                        {"edit": edit, "recapture": recap}
+                        {"edit": edit, **_STALE}
                     ), indent=2)
                 if name == "set_estimate_rate":
                     # line_number is 1-based (qchub UI); internal API is 0-based.
@@ -1494,9 +1504,8 @@ def execute_tool(
                         float(args["unit_price"]),
                         extra_rate=float(args.get("extra_rate", 0.0)),
                     )
-                    recap = _auto_recapture(qchub_edit_session)
                     return json.dumps(_scrub_dollars_from_estimate_result(
-                        {"edit": edit, "recapture": recap}
+                        {"edit": edit, **_STALE}
                     ), indent=2)
                 if name == "apply_estimate_rate_to_all_matching":
                     edit = qchub_edit_session.apply_rate_to_all_matching(
@@ -1504,15 +1513,16 @@ def execute_tool(
                         float(args["unit_price"]),
                         extra_rate=float(args.get("extra_rate", 0.0)),
                     )
-                    recap = _auto_recapture(qchub_edit_session)
                     return json.dumps(_scrub_dollars_from_estimate_result(
-                        {"edit": edit, "recapture": recap}
+                        {"edit": edit, **_STALE}
                     ), indent=2)
                 # Native-cog bulk-apply trio. Each takes a single line_number
                 # belonging to the target location, sets the rate on that
                 # location's cog-bearing row, then picks the scoped menu
                 # item. qchub fans the rate out server-side -> ONE Angular
-                # cycle, ONE recap, ONE PDF, regardless of row count.
+                # cycle. Still no auto-recap; Ellen calls re_capture_estimate
+                # once after her batch (which may be just the single cog
+                # call if all rows share rates).
                 # Documented in project_qchub_estimate_cog_bulk_apply.md.
                 if name in ("apply_rate_to_location", "apply_rate_to_all_locations", "apply_rate_to_rest_of_group"):
                     scope = {
@@ -1526,9 +1536,8 @@ def execute_tool(
                         float(args["unit_price"]),
                         extra_rate=float(args.get("extra_rate", 0.0)),
                     )
-                    recap = _auto_recapture(qchub_edit_session)
                     return json.dumps(_scrub_dollars_from_estimate_result(
-                        {"edit": edit, "recapture": recap}
+                        {"edit": edit, **_STALE}
                     ), indent=2)
                 if name == "re_capture_estimate":
                     # Direct re-capture still available for Ellen to
