@@ -41,6 +41,13 @@ class ChatPanel(QWidget):
         self.history = QTextBrowser()
         self.history.setReadOnly(True)
         self.history.setLineWrapMode(QTextBrowser.LineWrapMode.WidgetWidth)
+        # Decline file drops so they propagate up to MainWindow's window-wide
+        # drop handler instead of being silently swallowed as "insert URL as
+        # text." Both QTextBrowser and QLineEdit default to acceptDrops=True
+        # for text drops — for a chat panel that should never accept any
+        # external drop (file or text), we explicitly opt out. Established
+        # 2026-05-26 after user asked why drops on the chat area didn't work.
+        self.history.setAcceptDrops(False)
         # Open links via QDesktopServices instead of the built-in handler so
         # file:// paths open in Explorer correctly on Windows.
         self.history.setOpenLinks(False)
@@ -62,6 +69,10 @@ class ChatPanel(QWidget):
         )
         self.input.setFont(chat_font)
         self.input.returnPressed.connect(self._on_send)
+        # Decline file drops here too — see the QTextBrowser comment above.
+        # Without this, dragging an .eml over the input field showed the
+        # text-insert cursor but never reached the window-level handler.
+        self.input.setAcceptDrops(False)
         self.btn_send = QPushButton("Send")
         self.btn_send.setFont(chat_font)
         self.btn_send.clicked.connect(self._on_send)
