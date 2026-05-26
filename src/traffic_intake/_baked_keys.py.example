@@ -1,0 +1,23 @@
+"""TEMPLATE for the gitignored `_baked_keys.py` the installer build script
+generates. Copy to `_baked_keys.py` and fill in the actual shared keys
+QC ships with the installer.
+
+DO NOT commit `_baked_keys.py` — `.gitignore` excludes it. Real keys
+live only in the build environment + the produced installer binaries.
+
+Dev checkouts that lack this file fall back to env vars (preferred) or
+the OS keyring (legacy from when Settings let users enter these keys).
+"""
+
+# Shared Anthropic API key for end users. Power users can override via
+# the ANTHROPIC_API_KEY env var. Format: starts with `sk-ant-`.
+ANTHROPIC = "sk-ant-api03-REPLACE-AT-BUILD-TIME"
+
+# Shared Google Cloud key with Geocoding API enabled. Used for city-bbox
+# resolution that feeds HERE's proximity bias + the legacy-chain
+# fallback when HERE misses. Format: starts with `AIza`.
+GOOGLE_GEOCODING = "AIza-REPLACE-AT-BUILD-TIME"
+
+# Shared HERE Geocoding & Search REST API key — primary geocoder for
+# every intersection. ~43-char alphanumeric.
+HERE = "REPLACE-AT-BUILD-TIME"

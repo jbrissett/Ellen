@@ -687,34 +687,13 @@ class MainWindow(QMainWindow):
             )
             return
 
-        settings = QSettings("Quality Counts", "Traffic Intake")
-        if not settings.value("skip_mymaps_confirm", False, type=bool):
-            msg_text = (
-                f"An Edge window will open to create the map in Google MyMaps. "
-                f"{placed} pin(s) will be added."
-            )
-            if unplaced:
-                msg_text += f" {unplaced} without coordinates will be skipped."
-            msg_text += (
-                "\n\nFirst-run only: sign into Google in the Edge window when it appears. "
-                "Don't close the window during automation — only close it when the success dialog appears.\n\nContinue?"
-            )
-
-            dlg = QMessageBox(self)
-            dlg.setWindowTitle("Create MyMaps map")
-            dlg.setIcon(QMessageBox.Icon.Question)
-            dlg.setText(msg_text)
-            dlg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-            dlg.setDefaultButton(QMessageBox.StandardButton.Yes)
-            cb = QCheckBox("Don't show this again")
-            dlg.setCheckBox(cb)
-
-            choice = dlg.exec()
-            if choice != QMessageBox.StandardButton.Yes:
-                return
-            if cb.isChecked():
-                settings.setValue("skip_mymaps_confirm", True)
-                self.status("MyMaps confirmation hidden — re-enable in settings later if needed.")
+        # Pre-MyMaps confirmation dialog removed 2026-05-26. The dialog
+        # used to ask "An Edge window will open... sign into Google in
+        # the Edge window when it appears" — but now Google sign-in lives
+        # in Settings (see the "Sign in to Google for MyMaps" button)
+        # and the headless toggle means no Edge window pops up by
+        # default. If the user hasn't signed in, MyMaps fails and Ellen
+        # surfaces a clear "Sign in via Settings first" error.
 
         self.btn_map.setEnabled(False)
         self.drop_zone.setBusy(True, "Creating MyMaps map (browser window opening)…")

@@ -1,10 +1,29 @@
-"""Settings dialog — manage stored API key and qchub credentials."""
+"""Settings dialog — user-specific credentials + preferences.
+
+Refactored 2026-05-26 from the wider "every API key as a field" panel
+into a focused dialog. The shared API keys (Anthropic, Google,
+HERE) are baked at install time and resolved via config.py's
+env > keyring > baked fallback; users don't enter them here. What
+remains is genuinely per-user state:
+
+  - qchub login (per-user QC credentials)
+  - Google MyMaps sign-in (per-user; opens a visible Edge for
+    one-time Google sign-in, then the shared browser profile
+    persists the session for every future MyMaps run)
+  - Headless toggle (per-user preference)
+
+The chat-model dropdown and the "Show MyMaps confirmation" checkbox
+were both removed — model is fixed to the "auto" fallback chain, and
+the MyMaps confirm dialog is gone (Google sign-in now lives here in
+Settings instead).
+"""
 from __future__ import annotations
+
+from datetime import datetime
 
 from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import (
     QCheckBox,
-    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -19,94 +38,23 @@ from PySide6.QtWidgets import (
 
 from .. import config
 
-# Chat model preference options surfaced in the dropdown. Key matches what
-# `chat.resolve_model_chain` accepts; label is what the user sees.
-_CHAT_MODEL_OPTIONS = [
-    ("auto",   "Auto — Sonnet → Opus → Haiku (recommended)"),
-    ("sonnet", "Sonnet 4.6 only (balanced; default)"),
-    ("opus",   "Opus 4.7 only (most capable; ~3× cost)"),
-    ("haiku",  "Haiku 4.5 only (cheapest, fastest; weaker at tool sequencing)"),
-]
-
 
 class SettingsDialog(QDialog):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setWindowTitle("Ellen — Settings")
-        self.resize(540, 280)
+        self.resize(560, 360)
 
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(
-            "Credentials are stored in Windows Credential Manager and never leave this machine."
+            "Per-user credentials and preferences. Stored in Windows "
+            "Credential Manager (never leave this machine)."
         ))
 
         form = QFormLayout()
         layout.addLayout(form)
 
-        self.api_key_input = QLineEdit()
-        self.api_key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        try:
-            existing = config.get_api_key()
-            self.api_key_input.setPlaceholderText(f"(saved: {existing[:12]}…) — paste a new key to overwrite")
-        except Exception:
-            self.api_key_input.setPlaceholderText("sk-ant-api03-…")
-
-        show_btn = QPushButton("Show")
-        show_btn.setCheckable(True)
-        show_btn.toggled.connect(
-            lambda checked: self.api_key_input.setEchoMode(
-                QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
-            )
-        )
-        api_row = QHBoxLayout()
-        api_row.addWidget(self.api_key_input, 1)
-        api_row.addWidget(show_btn)
-        api_row_widget = QWidget()
-        api_row_widget.setLayout(api_row)
-        form.addRow("Anthropic API key:", api_row_widget)
-
-        self.google_key_input = QLineEdit()
-        self.google_key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        google_existing = config.get_google_geocoding_key()
-        if google_existing:
-            self.google_key_input.setPlaceholderText(f"(saved: {google_existing[:12]}…) — paste a new key to overwrite")
-        else:
-            self.google_key_input.setPlaceholderText("AIza…")
-        google_show = QPushButton("Show")
-        google_show.setCheckable(True)
-        google_show.toggled.connect(
-            lambda checked: self.google_key_input.setEchoMode(
-                QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
-            )
-        )
-        google_row = QHBoxLayout()
-        google_row.addWidget(self.google_key_input, 1)
-        google_row.addWidget(google_show)
-        google_row_widget = QWidget()
-        google_row_widget.setLayout(google_row)
-        form.addRow("Google Geocoding API key:", google_row_widget)
-
-        self.here_key_input = QLineEdit()
-        self.here_key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        here_existing = config.get_here_api_key()
-        if here_existing:
-            self.here_key_input.setPlaceholderText(f"(saved: {here_existing[:12]}…) — paste a new key to overwrite")
-        else:
-            self.here_key_input.setPlaceholderText("HERE Geocoding & Search REST API key (~43 chars)")
-        here_show = QPushButton("Show")
-        here_show.setCheckable(True)
-        here_show.toggled.connect(
-            lambda checked: self.here_key_input.setEchoMode(
-                QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
-            )
-        )
-        here_row = QHBoxLayout()
-        here_row.addWidget(self.here_key_input, 1)
-        here_row.addWidget(here_show)
-        here_row_widget = QWidget()
-        here_row_widget.setLayout(here_row)
-        form.addRow("HERE API key:", here_row_widget)
-
+        # ----- qchub login -----
         self.qchub_user_input = QLineEdit()
         self.qchub_pass_input = QLineEdit()
         self.qchub_pass_input.setEchoMode(QLineEdit.EchoMode.Password)
@@ -117,32 +65,49 @@ class SettingsDialog(QDialog):
         form.addRow("qchub username:", self.qchub_user_input)
         form.addRow("qchub password:", self.qchub_pass_input)
 
-        # UI preferences
-        ttk_settings = QSettings("Quality Counts", "Traffic Intake")
-
-        # Chat model preference — controls which Claude model Ellen uses,
-        # with an Auto option that falls back across models when one is
-        # overloaded (e.g., the Anthropic-overload outage 2026-05-14).
-        self.chat_model_combo = QComboBox()
-        for key, label in _CHAT_MODEL_OPTIONS:
-            self.chat_model_combo.addItem(label, userData=key)
-        current_pref = str(ttk_settings.value("chat_model", "auto"))
-        for i in range(self.chat_model_combo.count()):
-            if self.chat_model_combo.itemData(i) == current_pref:
-                self.chat_model_combo.setCurrentIndex(i)
-                break
-        form.addRow("Chat model (Ellen):", self.chat_model_combo)
-
-        self.show_mymaps_confirm = QCheckBox("Show 'Create MyMaps map' confirmation dialog")
-        self.show_mymaps_confirm.setChecked(
-            not ttk_settings.value("skip_mymaps_confirm", False, type=bool)
+        # ----- Google MyMaps sign-in -----
+        # Visual divider before the Google section so it doesn't feel
+        # like it's part of qchub.
+        layout.addSpacing(8)
+        google_header = QLabel("<b>Google account (for MyMaps)</b>")
+        layout.addWidget(google_header)
+        google_note = QLabel(
+            "MyMaps requires a Google sign-in. Click below to open Edge to "
+            "Google's sign-in page; the saved session is shared with every "
+            "future MyMaps run (headless or visible)."
         )
-        layout.addWidget(self.show_mymaps_confirm)
+        google_note.setWordWrap(True)
+        google_note.setStyleSheet("color:#666;")
+        layout.addWidget(google_note)
 
-        # Headless mode — when on, MyMaps and qchub Playwright sessions
-        # launch invisibly. Mass-deploy default is ON (set by the
-        # installer). Dev / diagnostic default is OFF so the user can
-        # watch the browser drive through the workflow.
+        # Status row: current account + last sign-in timestamp.
+        signin_settings = QSettings("Quality Counts", "Traffic Intake")
+        saved_email = config.get_google_mymaps_email()
+        last_signin_ts = signin_settings.value("google_signin_last_attempted_at", "", type=str)
+        status_text = self._format_google_status(saved_email, last_signin_ts)
+        self.google_status_label = QLabel(status_text)
+        self.google_status_label.setStyleSheet("padding:4px 0;")
+        layout.addWidget(self.google_status_label)
+
+        google_btn_row = QHBoxLayout()
+        self.btn_google_signin = QPushButton("Sign in to Google for MyMaps…")
+        self.btn_google_signin.clicked.connect(self._on_google_signin_clicked)
+        google_btn_row.addWidget(self.btn_google_signin)
+        # Email field — informational. User can type the email of the
+        # account they signed in with so the status line reads cleanly.
+        # We don't auto-detect (would need a network call) — trust the
+        # user's input.
+        self.google_email_input = QLineEdit()
+        self.google_email_input.setPlaceholderText("(your Google email — optional, for display)")
+        if saved_email:
+            self.google_email_input.setText(saved_email)
+        google_btn_row.addWidget(self.google_email_input, 1)
+        google_btn_row_widget = QWidget()
+        google_btn_row_widget.setLayout(google_btn_row)
+        layout.addWidget(google_btn_row_widget)
+
+        # ----- Headless mode -----
+        layout.addSpacing(8)
         from ..runtime_settings import is_headless_mode
         self.headless_checkbox = QCheckBox(
             "Run browsers invisibly (headless mode) — recommended for everyday use"
@@ -156,6 +121,7 @@ class SettingsDialog(QDialog):
         )
         layout.addWidget(self.headless_checkbox)
 
+        # ----- Save / Cancel -----
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
         )
@@ -164,64 +130,43 @@ class SettingsDialog(QDialog):
         layout.addStretch(1)
         layout.addWidget(buttons)
 
+    @staticmethod
+    def _format_google_status(email: str | None, last_attempted: str) -> str:
+        if email and last_attempted:
+            return f"Signed in as: <b>{email}</b> &nbsp;·&nbsp; last sign-in: {last_attempted}"
+        if email:
+            return f"Signed in as: <b>{email}</b>"
+        if last_attempted:
+            return f"<i>Sign-in attempted: {last_attempted}</i> — close the Edge window when done."
+        return "<i>Not signed in yet.</i>"
+
+    def _on_google_signin_clicked(self) -> None:
+        """Open Edge to Google sign-in with the shared MyMaps profile.
+        User signs in manually + closes the browser when done; the saved
+        cookies persist so future MyMaps runs can pick up the session.
+        """
+        from ..google_signin import launch_google_signin
+        ok, message = launch_google_signin()
+        if not ok:
+            QMessageBox.warning(self, "Couldn't launch Edge", message)
+            return
+        # Record the attempt timestamp so the status line shows recency
+        # even before the user types in their email.
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        QSettings("Quality Counts", "Traffic Intake").setValue(
+            "google_signin_last_attempted_at", ts,
+        )
+        # Update the status label in place so the user sees recognition.
+        saved_email = self.google_email_input.text().strip() or config.get_google_mymaps_email()
+        self.google_status_label.setText(self._format_google_status(saved_email, ts))
+        QMessageBox.information(
+            self, "Sign in to Google",
+            message + "\n\nWhen you're done signing in, close the Edge window "
+            "and click Save to persist your email (optional).",
+        )
+
     def save(self) -> None:
-        api = self.api_key_input.text().strip()
-        if api:
-            if not api.startswith("sk-ant-"):
-                if QMessageBox.question(
-                    self, "Unexpected format",
-                    "That doesn't look like an Anthropic key (expected to start with 'sk-ant-'). Save anyway?",
-                ) != QMessageBox.StandardButton.Yes:
-                    return
-            try:
-                config.set_api_key(api)
-            except Exception as exc:
-                QMessageBox.critical(self, "Save failed", str(exc))
-                return
-
-        google = self.google_key_input.text().strip()
-        if google:
-            if not google.startswith("AIza"):
-                if QMessageBox.question(
-                    self, "Unexpected format",
-                    "That doesn't look like a Google API key (expected to start with 'AIza'). Save anyway?",
-                ) != QMessageBox.StandardButton.Yes:
-                    return
-            try:
-                config.set_google_geocoding_key(google)
-            except Exception as exc:
-                QMessageBox.critical(self, "Save failed", str(exc))
-                return
-
-        here = self.here_key_input.text().strip()
-        if here:
-            # HERE keys are typically ~43 chars alphanumeric + "-_"; flag
-            # obvious mistakes (too short / contains spaces) but don't be
-            # overly strict — HERE has rotated key formats over the years.
-            if len(here) < 20 or " " in here:
-                if QMessageBox.question(
-                    self, "Unexpected format",
-                    "That doesn't look like a HERE REST API key (expected ~43-char alphanumeric, "
-                    "no spaces). Save anyway?",
-                ) != QMessageBox.StandardButton.Yes:
-                    return
-            try:
-                config.set_here_api_key(here)
-            except Exception as exc:
-                QMessageBox.critical(self, "Save failed", str(exc))
-                return
-
-        # Persist UI preferences
-        settings = QSettings("Quality Counts", "Traffic Intake")
-        settings.setValue(
-            "skip_mymaps_confirm", not self.show_mymaps_confirm.isChecked()
-        )
-        settings.setValue(
-            "chat_model", self.chat_model_combo.currentData() or "auto",
-        )
-        from ..runtime_settings import set_headless_mode
-        set_headless_mode(self.headless_checkbox.isChecked())
-
+        # qchub credentials
         user = self.qchub_user_input.text().strip()
         pw = self.qchub_pass_input.text()
         if user and pw:
@@ -239,5 +184,18 @@ class SettingsDialog(QDialog):
                     "Username changed but no password entered. Both must be saved together.",
                 )
                 return
+
+        # Google MyMaps email (optional, display-only).
+        new_email = self.google_email_input.text().strip()
+        if new_email:
+            try:
+                config.set_google_mymaps_email(new_email)
+            except Exception as exc:
+                QMessageBox.critical(self, "Save failed", str(exc))
+                return
+
+        # Headless preference
+        from ..runtime_settings import set_headless_mode
+        set_headless_mode(self.headless_checkbox.isChecked())
 
         self.accept()
