@@ -994,19 +994,13 @@ def _run(
             elif estimate:
                 note_parts.append("Estimate captured (no lines parsed — see HTML).")
             note_parts.append("Browser left open for verification.")
-            # Positive signal: estimate modal is OPEN now and edit tools work.
-            # Surfaced here so Ellen has unambiguous proof state rather than
-            # hedging with "I'll do it when the modal is live" (which is
-            # always a hallucination at this point — the modal IS live, that's
-            # what "Estimate captured" means). Observed run-20260526-113813:
-            # Ellen waited for "modal to be live" 60s+ after this note posted.
-            note_parts.append(
-                "Estimate modal is OPEN — edit tools (set_estimate_subtype, "
-                "set_estimate_rate, apply_rate_to_*, re_capture_estimate) are "
-                "live RIGHT NOW. Apply any pending pre-submit instructions in "
-                "your VERY NEXT response — do not wait, do not say 'when the "
-                "modal is up'."
-            )
+            # NOTE: Modal-is-open / apply-pending-instructions guidance USED
+            # to live here, but it leaked developer language ("edit tools
+            # are live", "VERY NEXT response", "do not wait") into the
+            # user-visible chat (user feedback 2026-05-26 run-20260526-120226).
+            # The same guidance now lives in app.py's `_fire_post_qchub_turn`
+            # synthetic chat turn, which is sent ONLY to Ellen and never
+            # rendered in the chat panel. Keep this user-visible note clean.
             note = " ".join(note_parts)
         else:
             note = "Submit clicked but order ID wasn't captured. Verify in the browser."
@@ -1038,9 +1032,17 @@ def _run(
         # checking for browser-closed. Replaces the old wait_for_event
         # so Ellen can drive subtype/rate edits + re-capture against
         # the live page.
+        # Threaded through so the recap version counter starts at the
+        # right place. False (initial capture deferred the PDF) = Ellen's
+        # first recap writes Estimate_NNNNN.pdf (no suffix); True = first
+        # recap writes _v2.
+        initial_pdf_saved = (
+            estimate is not None and getattr(estimate, "pdf_path", None) is not None
+        )
         _dispatch_edit_commands_until_done(
             context, page, edit_session, order_id, log,
             timeout_sec=manual_finish_timeout_sec,
+            initial_pdf_saved=initial_pdf_saved,
         )
 
         return result
@@ -3772,7 +3774,7 @@ def _apply_outliers_to_estimate_modal(
 
 def _capture_estimate(
     page: Page, order_id: str, run_dir: Path, log: ProgressCallback,
-    *, request: Optional[StudyRequest] = None,
+    *, request: Optional[StudyRequest] = None, download_pdf: bool = False,
 ) -> Optional[Estimate]:
     """After SUBMIT REQUEST redirected us to /Admin/Orders/{id}, open the
     Estimate modal and capture the priced lines so the user can review
@@ -3789,9 +3791,16 @@ def _capture_estimate(
       4. Best-effort parse: each editable row has a `<select>` (subtype)
          next to two `<input type="number">` (unit price + quantity).
          Walk those to extract structured lines.
-      5. Optionally trigger PREVIEW to download the PDF artifact, captured
-         via `expect_download` so the user's browser doesn't pop a Save
-         As dialog.
+      5. (Optional, only when `download_pdf=True`) Trigger PREVIEW to
+         download the PDF artifact. Default is FALSE — the initial
+         capture skips the PDF so users don't end up with both
+         Estimate_NNNNN.pdf (pre-edit, useless) and
+         Estimate_NNNNN_v2.pdf (post-edit, the one they actually
+         wanted) cluttering Downloads (user feedback 2026-05-26).
+         Ellen's first `re_capture_estimate` produces the FIRST and
+         ONLY PDF in the common case. Set to True only when callers
+         need a PDF immediately (e.g., a non-chat consumer that won't
+         drive Ellen's edit flow).
 
     Returns None if the modal can't be opened — caller treats it as "no
     estimate captured" rather than failing the whole order.
@@ -3900,6 +3909,29 @@ def _capture_estimate(
     # picks document-order which is the top inert button — observed
     # run-20260514-225436. Use `.last` to hit the footer button.
     pdf_path: Optional[Path] = None
+    if not download_pdf:
+        # Skip the PDF download. The caller (initial qchub capture by
+        # default) wants the parsed line state + HTML snapshot only;
+        # Ellen's first re_capture_estimate will produce the FIRST PDF
+        # (after she applies any pending pre-submit instructions), so
+        # the user sees ONE PDF in Downloads instead of v1 + v2.
+        log("(Initial capture: skipping PDF download — Ellen's first re_capture will produce the PDF.)")
+        # Fold the auto-applied subtype summary into parse_note (same
+        # logic as the post-PDF return below) so Ellen can see what
+        # corrections were made.
+        if auto_applied_summary:
+            note_extra = "Auto-applied subtype outliers: " + "; ".join(auto_applied_summary)
+            parse_note = f"{parse_note}\n{note_extra}" if parse_note else note_extra
+        return Estimate(
+            order_id=order_id,
+            order_url=page.url,
+            lines=lines,
+            total=grand_total,
+            html_path=str(html_path) if html_path else None,
+            screenshot_path=str(png_path) if png_path else None,
+            pdf_path=None,
+            parse_note=parse_note,
+        )
     captured_downloads: list = []
     captured_pdf_responses: list = []
 
@@ -4875,12 +4907,21 @@ def _execute_edit_command(
 
 def _dispatch_edit_commands_until_done(
     context, page: Page, session: "QchubEditSession", order_id: Optional[str],
-    log: ProgressCallback, *, timeout_sec: int,
+    log: ProgressCallback, *, timeout_sec: int, initial_pdf_saved: bool = True,
 ) -> None:
     """Replaces the blocking `wait_for_event("close")`. Drains commands
     from `session.command_queue`, executes them on the live page, and
     exits when EITHER (a) the user closed the browser, or (b) the
     `timeout_sec` budget elapsed.
+
+    `initial_pdf_saved`: True if the initial _capture_estimate produced a
+    PDF (legacy `download_pdf=True` path). False if the initial capture
+    skipped the PDF (current default — user 2026-05-26 wanted ONE PDF in
+    Downloads, not v1+v2). Controls where the version counter starts so
+    Ellen's first recap is named correctly:
+      - True  → counter starts at 1; Ellen's first recap = v2 → `_v2` suffix
+      - False → counter starts at 0; Ellen's first recap = v1 → no suffix
+                (file becomes `Estimate_NNNNN.pdf`, the user's only PDF)
     """
     if order_id is None:
         # No order ID means no estimate modal — nothing for Ellen to edit.
@@ -4894,7 +4935,7 @@ def _dispatch_edit_commands_until_done(
             log(f"(post-ready wait ended: {type(exc).__name__}: {exc})")
         return
 
-    version_holder = [1]  # mutable counter so _execute_edit_command can bump
+    version_holder = [1 if initial_pdf_saved else 0]
     end_time = time.time() + timeout_sec
     log(
         f"Browser staying open up to {timeout_sec // 60} min "

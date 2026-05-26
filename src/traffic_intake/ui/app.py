@@ -756,6 +756,13 @@ class MainWindow(QMainWindow):
                     f"<a href='file:///{pp}'>{fname}</a> "
                     f"<span style='color:#666'>(<a href='file:///{folder}'>open folder</a>)</span>"
                 )
+            else:
+                # No PDF yet — initial capture deferred so Ellen's first
+                # re_capture produces the ONE PDF (user 2026-05-26 wanted
+                # to avoid the v1+v2 clutter). Ellen will produce it
+                # shortly via the synthetic post-qchub turn; user sees the
+                # PDF link land in the chat then.
+                parts.append("&nbsp;&nbsp;<i>Estimate PDF coming after Ellen applies any pending changes…</i>")
             # screenshot_path is kept on disk for diagnostics but not surfaced
             # in chat — it's a low-res capture of the modal, no value to the
             # user once the parsed lines + PDF are in front of them.
@@ -806,6 +813,12 @@ class MainWindow(QMainWindow):
             "RIGHT NOW. The qchub_edit_session is wired — do not hedge "
             "with 'when the modal is up' / 'as soon as it confirms open' / "
             "etc. IT IS UP.\n\n"
+            "IMPORTANT: the initial capture deliberately DID NOT download "
+            "a PDF (to avoid producing two PDFs — pre-edit v1 + post-edit "
+            "v2). Your call to re_capture_estimate produces the FIRST and "
+            "ONLY PDF (saved as Estimate_N.pdf, no version suffix). You "
+            "MUST call re_capture_estimate at least once before closing "
+            "— without it, the user gets no PDF in Downloads at all.\n\n"
             "Scan THIS conversation's prior turns for any pricing or "
             "subtype instructions the user has stated (e.g., 'all are "
             "Large', '$320 per TMC', 'the roundabout is Complex'). For "
@@ -813,12 +826,13 @@ class MainWindow(QMainWindow):
             "  1. Fire the relevant edit tool calls in THIS response "
             "(parallel — batch them; per the BATCH MULTI-ROW rule).\n"
             "  2. Then in your NEXT response, call re_capture_estimate "
-            "exactly ONCE.\n"
+            "exactly ONCE (this produces the user's PDF).\n"
             "  3. Then post the close: '[concise summary of what landed]. "
             "Anything else?'\n\n"
-            "If there are NO pending instructions, just post the close "
-            "with the v1 PDF: 'Order N submitted, estimate PDF in "
-            "Downloads. Anything else?' — do not invent edits.\n\n"
+            "If there are NO pending instructions: call re_capture_estimate "
+            "now (single tool call this turn), then post the close in your "
+            "next turn: 'Order N submitted, estimate PDF in Downloads. "
+            "Anything else?'. Do NOT invent edits to justify the recap.\n\n"
             "Important qchub quirk: the estimate modal renders TMC rows "
             "at 'Standard' by default REGARDLESS of what subtype was "
             "set at the group level pre-submit. If the user has "
