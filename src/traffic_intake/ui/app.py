@@ -119,12 +119,47 @@ class MainWindow(QMainWindow):
         # Right-click for native context menu (close, etc.) added later
         # if needed; left-click is the primary "bring me back" gesture.
         self._tray.activated.connect(self._on_tray_activated)
+        # Clicking the TOAST itself (not the tray icon) should also bring
+        # Ellen forward. Without this wiring, the toast was visual-only —
+        # user had to alt-tab manually after dismissing it. Established
+        # 2026-05-26: "clicking the notification does not bring ellen to
+        # the foreground."
+        self._tray.messageClicked.connect(self._bring_to_front)
         self._tray.show()
 
     def _on_tray_activated(self, reason) -> None:
         """Bring the main window forward when the user clicks the tray icon."""
         if reason == QSystemTrayIcon.ActivationReason.Trigger:
             self._bring_to_front()
+
+    def _is_user_focused_on_us(self) -> bool:
+        """True iff the user is actively looking at our main window
+        right now. Used to gate non-urgent toast notifications so they
+        don't fire when the user is already watching the chat.
+
+        On Windows we ask the OS directly via GetForegroundWindow() —
+        Qt's isActiveWindow() and applicationState() both failed to
+        catch real-world "user is in another app" cases (verified
+        2026-05-26: both reported active when the user had alt-tabbed
+        to Outlook). The native HWND comparison matches what the user
+        actually sees.
+
+        Minimized window → not focused (regardless of HWND check).
+        Non-Windows → fall back to isActiveWindow().
+        """
+        if self.isMinimized():
+            return False
+        if sys.platform != "win32":
+            return self.isActiveWindow()
+        try:
+            import ctypes
+            fg_hwnd = ctypes.windll.user32.GetForegroundWindow()
+            our_hwnd = int(self.winId())
+            return fg_hwnd == our_hwnd
+        except Exception:
+            # ctypes / shell32 unavailable in an exotic environment —
+            # fall back to Qt's check.
+            return self.isActiveWindow()
 
     def _bring_to_front(self) -> None:
         """Raise + activate the main window, restoring from minimized
@@ -165,24 +200,17 @@ class MainWindow(QMainWindow):
             return
         # Urgent failures always toast — even if the window is active —
         # so the user notices red-flag conditions. Non-urgent toasts
-        # only fire when the user isn't already watching the window.
-        # Use QApplication.applicationState() not self.isActiveWindow()
-        # — `isActiveWindow` reports True even when the OS foreground
-        # focus has moved to another app (Qt's "active window" is per-
-        # process, not per-OS-foreground). User feedback 2026-05-26:
-        # backgrounded the app, no toast fired on extraction-finished.
-        # applicationState() returns ApplicationActive only when the
-        # user's OS focus is genuinely on our app.
-        if not always and not urgent:
-            from PySide6.QtCore import QCoreApplication, Qt
-            app_inst = QCoreApplication.instance()
-            user_focused_on_app = (
-                app_inst is not None
-                and app_inst.applicationState() == Qt.ApplicationState.ApplicationActive
-                and not self.isMinimized()
-            )
-            if user_focused_on_app:
-                return
+        # only fire when the user isn't already watching our window.
+        # First attempt (2026-05-26 AM) used isActiveWindow() — fired
+        # toasts when user was already focused (Qt's "active window"
+        # is per-process, not per-OS-foreground). Second attempt used
+        # QApplication.applicationState() — still fired when focused
+        # (user-reported, 2026-05-26 PM). The reliable check on
+        # Windows is the OS-native GetForegroundWindow(): compare its
+        # returned HWND to our window's HWND. No Qt indirection,
+        # matches what the user actually sees.
+        if not always and not urgent and self._is_user_focused_on_us():
+            return
         icon_kind = (
             QSystemTrayIcon.MessageIcon.Critical
             if urgent
