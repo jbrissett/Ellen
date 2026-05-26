@@ -35,12 +35,31 @@ def _marker_path() -> Path:
 
 
 def playwright_browser_ready() -> bool:
-    """True if first-launch setup has already run.
+    """First-launch install BYPASSED 2026-05-26.
 
-    Fast — just file existence check. Subsequent launches skip the
-    full install attempt and proceed directly to MainWindow.
+    Original design: shell out to `playwright install msedge` on first
+    launch + write a marker file once done. Backfired in the PyInstaller
+    build because sys.executable points to the bundled Ellen.exe (not
+    a Python interpreter), so `sys.executable -m playwright install ...`
+    just re-launched Ellen, which hit the single-instance lock + handed
+    off — spawning a loop of orphan Ellen instances and never actually
+    installing Playwright.
+
+    Reality check: the PyInstaller bundle ALREADY ships Playwright's
+    full driver (verified in the build log — `playwright/driver/
+    node.exe` etc are all in dist/Ellen/_internal/playwright/), and
+    msedge channel uses system-installed Edge which ships with Win 11.
+    So no install step is required on a properly bundled .exe — the
+    first launch can go straight to MainWindow.
+
+    Keeping the file + symbol so the import in ui/__main__.py still
+    resolves; the function just always returns True so the install
+    code path never fires. Re-enabling the proper install (via
+    `from playwright.__main__ import main` direct invocation, not
+    subprocess) is a future-improvement if a deployment surfaces a
+    machine without Edge or with a missing Playwright driver.
     """
-    return _marker_path().exists()
+    return True
 
 
 def mark_playwright_browser_ready() -> None:
