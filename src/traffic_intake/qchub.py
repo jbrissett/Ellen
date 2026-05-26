@@ -3383,7 +3383,7 @@ def _group_locations_for_qchub(request: StudyRequest) -> list[dict[str, Any]]:
 
 
 def _wait_for_form_populated_before_submit(
-    page: Page, log: ProgressCallback, *, budget_sec: float = 20.0,
+    page: Page, log: ProgressCallback, *, budget_sec: float = 45.0,
 ) -> None:
     """Positive-signal gate before SUBMIT REQUEST. Polls until qchub's
     Angular state reports a non-empty `alertsRequest` array (the array
@@ -3411,6 +3411,15 @@ def _wait_for_form_populated_before_submit(
     On timeout, raises QchubError with a clear message instead of
     letting the silent-reject path swallow the run. The user can
     re-try; usually the upload completes in 5-10s on retry.
+
+    Budget history: 20s (2026-05-25 PM, initial) → 45s (2026-05-25 night
+    after order-176597-ish 28-pin tube group blew the 20s budget on the
+    Sarasota Kimley-Horn email). The 20s budget was sized against a
+    7-pin TMC; bigger KMLs (20+ pins) need more bind time, plus we
+    saw real-world server-side slow moments. 45s is enough that a
+    truly stuck bind still bails in well under a minute, but doesn't
+    leave the user staring at "Waiting for KML upload..." for 80s+
+    on a slow-but-recoverable run.
 
     Established 2026-05-25 from order-176588-adjacent failed Winchester
     run; user pasted dev console showing alertsRequest.length 0 at
