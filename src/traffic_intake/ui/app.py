@@ -307,6 +307,12 @@ class MainWindow(QMainWindow):
         #
         # Right column: chat panel takes all remaining space.
         left = QWidget()
+        # HARD CAP the left strip's width. Wide action-button labels
+        # ("Create MyMaps map…") were forcing the splitter to give the
+        # column ~half the window. Capping at 260px keeps the chat
+        # dominant regardless of child size hints. User can still drag
+        # the splitter wider if they really want to.
+        left.setMaximumWidth(260)
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(8, 8, 8, 8)
         left_layout.setSpacing(8)
@@ -339,7 +345,7 @@ class MainWindow(QMainWindow):
         # widen the left if they want; the default is chat-heavy.
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([320, 1080])
+        splitter.setSizes([240, 1160])
         splitter.setCollapsible(0, False)
         splitter.setCollapsible(1, False)
 
@@ -353,27 +359,36 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(splitter)
 
     def _build_action_row(self) -> QWidget:
-        # "Row" is now a column — the left strip is narrow so the buttons
-        # stack vertically. Method name retained for back-compat with
-        # callers that just expect a single QWidget.
-        col = QWidget()
-        layout = QVBoxLayout(col)
+        # Compact icon row — three small buttons that fit horizontally in
+        # the narrow (260px) left strip. Glyphs are Unicode pictographs
+        # rendered with the system's color-emoji font (Windows 11 ships
+        # Segoe UI Emoji). Tooltips carry the full action labels for
+        # discoverability; the visible glyph is the "small icon" the user
+        # asked for 2026-05-26.
+        row = QWidget()
+        layout = QHBoxLayout(row)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
+        layout.setSpacing(6)
 
-        self.btn_map = QPushButton("Create MyMaps map…")
-        self.btn_map.setEnabled(False)
-        self.btn_map.clicked.connect(self.on_create_map)
-        self.btn_qchub = QPushButton("Create qchub order…")
-        self.btn_qchub.setEnabled(False)
-        self.btn_qchub.clicked.connect(self.on_create_qchub_order)
-        self.btn_email = QPushButton("Draft response email…")
-        self.btn_email.setEnabled(False)
-        self.btn_email.clicked.connect(self.on_draft_email)
+        def _icon_btn(glyph: str, tooltip: str, handler) -> QPushButton:
+            btn = QPushButton(glyph)
+            btn.setToolTip(tooltip)
+            btn.setEnabled(False)
+            btn.setFixedSize(56, 40)
+            f = btn.font()
+            f.setPointSize(16)
+            btn.setFont(f)
+            btn.clicked.connect(handler)
+            return btn
+
+        self.btn_map = _icon_btn("🗺", "Create MyMaps map", self.on_create_map)
+        self.btn_qchub = _icon_btn("📋", "Create qchub order", self.on_create_qchub_order)
+        self.btn_email = _icon_btn("✉", "Draft response email", self.on_draft_email)
         layout.addWidget(self.btn_map)
         layout.addWidget(self.btn_qchub)
         layout.addWidget(self.btn_email)
-        return col
+        layout.addStretch(1)
+        return row
 
     def _build_toolbar(self) -> None:
         toolbar = QToolBar("Main")
