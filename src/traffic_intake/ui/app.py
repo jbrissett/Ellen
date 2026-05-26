@@ -689,6 +689,10 @@ class MainWindow(QMainWindow):
                 settings.setValue("skip_qchub_confirm", True)
 
         self.btn_qchub.setEnabled(False)
+        # Reset the progress-forwarding gate so this new run's pre-ready
+        # log messages reach drop_zone busy state. _on_qchub_finished will
+        # set this back to True when the order submits.
+        self._qchub_ready_emitted = False
         self.drop_zone.setBusy(True, "Creating qchub order (browser window opening)…")
         self.status("Creating qchub order…")
         run_qchub_creation(
@@ -703,9 +707,22 @@ class MainWindow(QMainWindow):
 
     def _on_qchub_progress(self, message: str) -> None:
         self.status(message)
-        self.drop_zone.setBusy(True, message)
+        # Stop re-busying the drop_zone after the order is ready. The qchub
+        # worker keeps logging through the post-submit manual-finish window
+        # (every edit-session call, the eventual "End-session requested by
+        # Ellen — closing qchub browser") and each log fired this callback,
+        # re-setting drop_zone status. When end_session triggered the worker
+        # to exit, the LAST log line ("End-session requested...") stayed
+        # pinned in the busy state with no finalize signal to clear it.
+        # Fix: only forward to drop_zone busy state UNTIL the order is
+        # marked ready; subsequent logs go to the status bar only.
+        # Established 2026-05-26 user report: drop_zone stuck on
+        # "End-session/closing qchub" after qchub had already closed.
+        if not getattr(self, "_qchub_ready_emitted", False):
+            self.drop_zone.setBusy(True, message)
 
     def _on_qchub_finished(self, result: CreateOrderResult) -> None:
+        self._qchub_ready_emitted = True
         self.btn_qchub.setEnabled(True)
         self.drop_zone.setBusy(False)
         self.status(f"qchub order created (id={result.order_id or 'unknown'}).")

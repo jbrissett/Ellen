@@ -86,12 +86,22 @@ class DropZone(QWidget):
         # Established 2026-05-26 from a screenshot showing the progress text
         # bleeding past the drop zone's visible bounds.
         self.subtitle.setWordWrap(True)
+        # Reserve vertical room so wrapped progress text (commonly 2-3 lines
+        # of ~30 chars each at 12pt) doesn't get squished against the
+        # busy_bar below. Without this, Qt gives the QLabel only its
+        # one-line preferred height even when the text wraps.
+        self.subtitle.setMinimumHeight(72)
         layout.addWidget(self.subtitle)
 
         # Indeterminate progress bar used as a 'working…' indicator. Hidden by default.
         self.busy_bar = QProgressBar()
         self.busy_bar.setRange(0, 0)  # indeterminate (moving stripe)
-        self.busy_bar.setFixedWidth(280)
+        # 200px fits within the 260px left-strip cap (with margins). The
+        # prior 280px was wider than the column itself, which forced the
+        # splitter to push the left pane past its setMaximumWidth target —
+        # observed run 2026-05-26 where the left ended up ~50% of the window
+        # despite the cap.
+        self.busy_bar.setFixedWidth(200)
         self.busy_bar.setTextVisible(False)
         self.busy_bar.hide()
         # center-align the progress bar in its row
