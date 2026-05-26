@@ -290,29 +290,41 @@ class MainWindow(QMainWindow):
         return self.size()
 
     def _build_central(self) -> None:
-        # Left pane: drop zone + extraction panel + actions (existing UI)
+        # Layout refactored 2026-05-26 per user direction: kill the bulky
+        # 3-tab extraction inspector (Summary / Locations / JSON) — same
+        # data is reachable via Ellen's tools, and the tabs were crowding
+        # the chat. New shape is a thin fixed-width left column + chat
+        # dominating the right.
+        #
+        # Left column (~320px):
+        #   * DropZone — taller than before since the tabs are gone;
+        #     visually communicates "big drop target" without claiming the
+        #     whole window. Window-wide drop forwarding (MainWindow.dropEvent
+        #     -> drop_zone) still lets you drop ANYWHERE including the chat.
+        #   * Compact StatusSummary strip — one paragraph: project, location
+        #     count, geocoding confidence, warnings.
+        #   * Action buttons stacked VERTICALLY (the column is narrow).
+        #
+        # Right column: chat panel takes all remaining space.
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(8, 8, 8, 8)
+        left_layout.setSpacing(8)
 
         self.drop_zone = DropZone()
         self.drop_zone.fileDropped.connect(self.on_file_dropped)
         self.drop_zone.diagnosticMessage.connect(self.status)
+        # Drop zone takes most of the vertical room — "big drop target" was
+        # explicit user direction. stretch=1 with no competing stretchers
+        # below means it absorbs all remaining vertical space.
         left_layout.addWidget(self.drop_zone, 1)
 
-        # Extraction panel and action row are ALWAYS visible. Their empty
-        # states (extraction_panel shows an italic "Drop an email above"
-        # placeholder; action_row shows three disabled buttons) carry zero
-        # confusion. Previously these were `setVisible(False)` at startup
-        # and toggled True on extraction-finished — but that toggle made
-        # the layout's preferred size jump, which made Qt reshape the
-        # window. Per user direction 2026-05-25: window sizing is a USER
-        # action only.
+        # Compact status replaces the tabs. Same setRequest/request API.
         self.extraction_panel = ExtractionPanel()
-        left_layout.addWidget(self.extraction_panel, 2)
+        left_layout.addWidget(self.extraction_panel, 0)
 
         self.action_row = self._build_action_row()
-        left_layout.addWidget(self.action_row)
+        left_layout.addWidget(self.action_row, 0)
 
         # Right pane: chat sidebar (persistent — always visible)
         self.chat_panel = ChatPanel()
@@ -321,9 +333,15 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(left)
         splitter.addWidget(self.chat_panel)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        splitter.setSizes([900, 600])
+        # Left column: pinned narrow so the chat dominates. setStretchFactor
+        # 0:1 means the LEFT keeps its size hint and the chat eats every
+        # extra pixel of window width. Users can still drag the splitter to
+        # widen the left if they want; the default is chat-heavy.
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([320, 1080])
+        splitter.setCollapsible(0, False)
+        splitter.setCollapsible(1, False)
 
         # Belt-and-suspenders: tell the splitter "don't push your sizeHint
         # up to the window." Combined with sizeHint() override above, this
@@ -335,9 +353,13 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(splitter)
 
     def _build_action_row(self) -> QWidget:
-        row = QWidget()
-        layout = QHBoxLayout(row)
+        # "Row" is now a column — the left strip is narrow so the buttons
+        # stack vertically. Method name retained for back-compat with
+        # callers that just expect a single QWidget.
+        col = QWidget()
+        layout = QVBoxLayout(col)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
 
         self.btn_map = QPushButton("Create MyMaps map…")
         self.btn_map.setEnabled(False)
@@ -351,8 +373,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.btn_map)
         layout.addWidget(self.btn_qchub)
         layout.addWidget(self.btn_email)
-        layout.addStretch(1)
-        return row
+        return col
 
     def _build_toolbar(self) -> None:
         toolbar = QToolBar("Main")
