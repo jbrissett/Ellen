@@ -81,6 +81,11 @@ class DropZone(QWidget):
             "After a map is built, also accepts an edited .kmz to apply pin corrections."
         )
         self.subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # Wrap so long progress messages ("edit-session bec71916] re_capture → ok")
+        # don't get clipped at the right edge of the narrow 260px left strip.
+        # Established 2026-05-26 from a screenshot showing the progress text
+        # bleeding past the drop zone's visible bounds.
+        self.subtitle.setWordWrap(True)
         layout.addWidget(self.subtitle)
 
         # Indeterminate progress bar used as a 'working…' indicator. Hidden by default.
