@@ -22,17 +22,18 @@ _ORG = "Quality Counts"
 _APP = "Traffic Intake"
 
 
-# Default for the headless toggle. TRUE = browsers run invisibly
-# (production / mass-deploy default per user direction 2026-05-24:
-# "the default setting should be invisible"). The project lead can
-# untick the Settings checkbox to surface the browsers for visual
-# diagnostics.
-#
-# Flipped from False → True 2026-05-24. Previous comment claimed the
-# installer would write this at install time; making it the code-level
-# default instead means a fresh install or a Settings-reset gets the
-# right behavior without depending on an installer post-step.
-_DEFAULT_HEADLESS = True
+# Default for the headless toggle. FALSE = browsers open visibly so the
+# user can watch the MyMaps + qchub automation work. Flipped back from
+# True → False 2026-05-26 per user direction: "default to off and I'll
+# toggle on after implementation of headless." Rationale: while the
+# tool is still being iterated on and trust is being built, visible
+# browsers let the user verify what's happening — and importantly,
+# spot edge cases that would otherwise hide silently in headless.
+# Once the workflow is stable and deployed, the user (or installer
+# post-step in a future packaged release) can flip to True for
+# production / mass-deploy invisibility. QSettings persists across
+# updates so a single toggle in the Settings dialog sticks.
+_DEFAULT_HEADLESS = False
 
 
 def is_headless_mode() -> bool:
