@@ -207,11 +207,15 @@ def _claim_distinct_taskbar_identity() -> None:
         return
     try:
         import ctypes
-        # Reverse-DNS-style ID. Format is arbitrary but must be unique
-        # to this app; matches the org / app naming we use elsewhere.
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-            "QualityCounts.Ellen.WorkplaceAssistant.1"
-        )
+        # Until we ship a Start Menu shortcut (via the v1 installer)
+        # that maps a reverse-DNS-style AUMID to a friendly display
+        # name, Windows shows the RAW AUMID string in toast headers.
+        # User observed this 2026-05-26: toasts showed
+        # "QualityCounts.Ellen.WorkplaceAssistant.1" as the app label.
+        # Use a clean short identifier instead so toasts read just
+        # "Ellen". The installer can swap back to a properly-namespaced
+        # AUMID + shortcut once it's built.
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Ellen")
     except Exception:
         pass
 
