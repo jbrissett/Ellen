@@ -782,6 +782,87 @@ TOOLS = [
         },
     },
     {
+        "name": "apply_rate_to_location",
+        "description": (
+            "Drive qchub's native per-location cog wheel to set rates on ALL "
+            "rows of ONE location in a single click. Best for multi-period "
+            "sites (one location with N time windows — e.g., AM peak + PM "
+            "peak at the same intersection). Equivalent to clicking the cog "
+            "on that location's first row and picking 'Apply rate to Location'. "
+            "Pass ANY line_number that belongs to the target location; "
+            "qchub normalizes to the cog-bearing first row internally. "
+            "STRICTLY prefer this over multiple set_estimate_rate calls "
+            "when the target rows share a location."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "line_number": {"type": "integer", "description": "1-based row number of any row in the target location."},
+                "unit_price": {"type": "number", "description": "Base study amount (Field 1) to set + propagate."},
+                "extra_rate": {
+                    "type": "number",
+                    "description": "Per-additional-unit rate (Field 2). Defaults to 0 when omitted.",
+                },
+            },
+            "required": ["line_number", "unit_price"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "apply_rate_to_all_locations",
+        "description": (
+            "Drive qchub's native cog wheel to fan a single rate across "
+            "EVERY location in the row's group, in one server-side action. "
+            "Equivalent to clicking a row's cog and picking 'Apply location "
+            "rates to all'. Best for 'every TMC in this group is $400 flat' "
+            "style requests. Pass any line_number — qchub uses the rate you "
+            "supply, not the row's current rate, and propagates from that "
+            "location's cog-bearing row to all locations in the group. "
+            "STRICTLY prefer this over multiple set_estimate_rate calls "
+            "when the target rows span multiple locations within ONE group."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "line_number": {"type": "integer", "description": "1-based row number of any row in the target group."},
+                "unit_price": {"type": "number", "description": "Base study amount (Field 1) to set + propagate."},
+                "extra_rate": {
+                    "type": "number",
+                    "description": "Per-additional-unit rate (Field 2). Defaults to 0 when omitted.",
+                },
+            },
+            "required": ["line_number", "unit_price"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "apply_rate_to_rest_of_group",
+        "description": (
+            "Drive qchub's native cog wheel to fan a rate across all "
+            "OTHER locations in the group (EXCLUDING the location the "
+            "line_number belongs to). Equivalent to clicking a row's cog "
+            "and picking 'Apply location rates to rest'. Useful when one "
+            "site has special pricing already set and you want the rest "
+            "of the group at a different rate. Pattern: set the special "
+            "site's rate first via set_estimate_rate or apply_rate_to_location, "
+            "then call this with a line from THAT special location to "
+            "blast all other locations to the standard rate."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "line_number": {"type": "integer", "description": "1-based row number of any row in the location to EXCLUDE from propagation."},
+                "unit_price": {"type": "number", "description": "Base study amount (Field 1) for the OTHER locations."},
+                "extra_rate": {
+                    "type": "number",
+                    "description": "Per-additional-unit rate (Field 2). Defaults to 0 when omitted.",
+                },
+            },
+            "required": ["line_number", "unit_price"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "apply_estimate_rate_to_all_matching",
         "description": (
             "Bulk-update the price field(s) on every line whose description "
@@ -974,7 +1055,20 @@ Action-trigger rules:
 - "queue study", "gap study", "delay study", "custom video survey" → GROUP-level Survey subtype. Set on the StudyLocation's survey_subtype BEFORE create_qchub_order.
 
 **Live Estimate editing (after qchub order is created)**:
-After a qchub order is submitted, the qchub browser stays open and you have six tools that directly drive the live Estimate modal: `get_estimate_lines`, `list_estimate_subtype_options`, `set_estimate_subtype`, `set_estimate_rate`, `apply_estimate_rate_to_all_matching`, `re_capture_estimate`. Use these when the user wants to amend subtypes or negotiate rates ("the TMCs are $400 each, not standard rate"; "change line 2 to volume+class"). Workflow:
+After a qchub order is submitted, the qchub browser stays open and you have these tools driving the live Estimate modal: `get_estimate_lines`, `list_estimate_subtype_options`, `set_estimate_subtype`, `set_estimate_rate`, `apply_rate_to_location`, `apply_rate_to_all_locations`, `apply_rate_to_rest_of_group`, `apply_estimate_rate_to_all_matching`, `re_capture_estimate`.
+
+**RATE-EDIT TOOL SELECTION — use the cog tools, not per-row set, whenever the request affects 2+ rows.** qchub's Estimate modal has a per-LOCATION cog wheel (one per location, anchored to that location's first time-window row) with three native bulk-apply options. Match the user's intent to the right cog tool BEFORE falling back to row-by-row:
+
+| User says... | Use |
+|---|---|
+| "set rates on this site at $X" (the site has multiple time windows) | `apply_rate_to_location(line_number=any row of that site, unit_price=X)` |
+| "$X across the board" / "$X for every TMC in this group" / "all locations $X" | `apply_rate_to_all_locations(line_number=any row in the group, unit_price=X)` |
+| "$X for everywhere EXCEPT this site" (you've already priced one site differently) | `apply_rate_to_rest_of_group(line_number=any row of the EXCLUDED site, unit_price=X)` |
+| "change just line 7 to $X" (single isolated row) | `set_estimate_rate(line_number=7, unit_price=X)` |
+
+The cog tools fan rates server-side in ONE Angular cycle → ONE recap → ONE PDF. Per-row `set_estimate_rate` triggers a separate auto-recap per call (even with the 4s coalesce defending against parallel bursts) — for 4 rows that's 4 recaps and 4 PDFs (v2/v3/v4/v5) instead of 1. The cost difference is real and user-visible (Downloads folder clutter + ~50-70s extra wall time per multi-row request). Documented anti-pattern observed run-20260525-212237 + run-20260525-214740.
+
+`apply_estimate_rate_to_all_matching` (substring-matched subtype filter) is the broader sledgehammer for CROSS-GROUP rate apply ("every TMC in the order, regardless of group, $X") — cogs operate within one group at a time. Default to the cog tools first; reach for `apply_estimate_rate_to_all_matching` only when the cog scopes can't express the intent. Use these when the user wants to amend subtypes or negotiate rates ("the TMCs are $400 each, not standard rate"; "change line 2 to volume+class"). Workflow:
 1. Always call `get_estimate_lines` first to see current state (it re-reads the modal, not the stale initial capture).
 2. For subtype edits: `list_estimate_subtype_options(line_number=N)` on one matching row first to read the exact option text, then `set_estimate_subtype` on each matching row.
 3. Make the edits (`set_estimate_subtype` / `set_estimate_rate` / `apply_estimate_rate_to_all_matching`).
@@ -1407,6 +1501,28 @@ def execute_tool(
                 if name == "apply_estimate_rate_to_all_matching":
                     edit = qchub_edit_session.apply_rate_to_all_matching(
                         str(args["subtype_contains"]),
+                        float(args["unit_price"]),
+                        extra_rate=float(args.get("extra_rate", 0.0)),
+                    )
+                    recap = _auto_recapture(qchub_edit_session)
+                    return json.dumps(_scrub_dollars_from_estimate_result(
+                        {"edit": edit, "recapture": recap}
+                    ), indent=2)
+                # Native-cog bulk-apply trio. Each takes a single line_number
+                # belonging to the target location, sets the rate on that
+                # location's cog-bearing row, then picks the scoped menu
+                # item. qchub fans the rate out server-side -> ONE Angular
+                # cycle, ONE recap, ONE PDF, regardless of row count.
+                # Documented in project_qchub_estimate_cog_bulk_apply.md.
+                if name in ("apply_rate_to_location", "apply_rate_to_all_locations", "apply_rate_to_rest_of_group"):
+                    scope = {
+                        "apply_rate_to_location": "location",
+                        "apply_rate_to_all_locations": "all",
+                        "apply_rate_to_rest_of_group": "rest",
+                    }[name]
+                    edit = qchub_edit_session.apply_rate_via_cog(
+                        int(args["line_number"]) - 1,  # 1-based -> 0-based
+                        scope,
                         float(args["unit_price"]),
                         extra_rate=float(args.get("extra_rate", 0.0)),
                     )
