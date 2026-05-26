@@ -4210,8 +4210,14 @@ def _parse_estimate_rows_from_modal(modal) -> list[EstimateLine]:
 
 
 def _estimate_line_to_dict(L: EstimateLine, index: int) -> dict:
+    # `index` is the internal 0-based array index. `line_number` is the
+    # 1-based row number qchub's UI displays — also what the user means
+    # when they say "line 3". Tools (set_estimate_subtype etc.) take
+    # `line_number` as input. `index` is retained for internal/legacy
+    # use but Ellen should reference `line_number` when calling tools.
     return {
         "index": index,
+        "line_number": index + 1,
         "description": L.description,
         "unit_price": L.unit_price,
         "quantity": L.quantity,

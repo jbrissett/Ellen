@@ -721,16 +721,16 @@ TOOLS = [
             "Count' vs 'Class, Volume -- 4+ Lanes'). The available options "
             "depend on the GROUP this row belongs to: Tube > Volume groups have "
             "different options than Tube > Volume,Class groups. Returns "
-            "{line_index, current, options: [str, ...]}. Note: Survey-group rows "
+            "{line_number, current, options: [str, ...]}. Note: Survey-group rows "
             "have NO subtype dropdown (only price is editable) — calling this "
             "on a survey row returns an empty options list."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "line_index": {"type": "integer", "description": "0-based row index from get_estimate_lines"},
+                "line_number": {"type": "integer", "description": "1-based row number as shown in qchub's UI (Line 1, Line 2, ...). Pass the user's number verbatim — no subtraction needed."},
             },
-            "required": ["line_index"],
+            "required": ["line_number"],
             "additionalProperties": False,
         },
     },
@@ -747,10 +747,10 @@ TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "line_index": {"type": "integer", "description": "0-based row index from get_estimate_lines"},
+                "line_number": {"type": "integer", "description": "1-based row number as shown in qchub's UI (Line 1, Line 2, ...). Pass the user's number verbatim — no subtraction needed."},
                 "subtype": {"type": "string", "description": "Substring of the qchub option text"},
             },
-            "required": ["line_index", "subtype"],
+            "required": ["line_number", "subtype"],
             "additionalProperties": False,
         },
     },
@@ -770,14 +770,14 @@ TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "line_index": {"type": "integer", "description": "0-based row index from get_estimate_lines"},
+                "line_number": {"type": "integer", "description": "1-based row number as shown in qchub's UI (Line 1, Line 2, ...). Pass the user's number verbatim — no subtraction needed."},
                 "unit_price": {"type": "number", "description": "Base study amount (Field 1)"},
                 "extra_rate": {
                     "type": "number",
                     "description": "Per-additional-unit rate (Field 2). Defaults to 0 when omitted — leave omitted for the common 'fixed amount per row' case.",
                 },
             },
-            "required": ["line_index", "unit_price"],
+            "required": ["line_number", "unit_price"],
             "additionalProperties": False,
         },
     },
@@ -966,7 +966,7 @@ Action-trigger rules:
    - Tube > Volume, Speed > similar lane-count variants
    - TMC > group rows: `Standard`, `Large`, `Complex`, `w/Demand`, `Bikes Only`, `Ins & Outs`, etc.
    - **Survey rows have NO subtype dropdown** — only price is editable. Don't try `set_estimate_subtype` on a survey row.
-- BEFORE picking an estimate-modal subtype, ALWAYS call `list_estimate_subtype_options(line_index)` to read the LIVE options for that row's group. The available options depend on the group; guessing leads to silent no-ops. Pattern: get_estimate_lines → identify the rows you want → list_estimate_subtype_options on one of them → pick the exact option text → set_estimate_subtype on all matching rows.
+- BEFORE picking an estimate-modal subtype, ALWAYS call `list_estimate_subtype_options(line_number=N)` to read the LIVE options for that row's group. The available options depend on the group; guessing leads to silent no-ops. Pattern: get_estimate_lines → identify the rows you want → list_estimate_subtype_options on one of them → pick the exact option text → set_estimate_subtype on all matching rows.
 
 **Mapping user vocabulary to subtype layer:**
 - "ATR video volume" / "video ATR" → GROUP-level Tube subtype (`Video ATR - Volume`). Set on the StudyLocation's tube_subtype BEFORE create_qchub_order. NOT an estimate-modal value.
@@ -976,12 +976,12 @@ Action-trigger rules:
 **Live Estimate editing (after qchub order is created)**:
 After a qchub order is submitted, the qchub browser stays open and you have six tools that directly drive the live Estimate modal: `get_estimate_lines`, `list_estimate_subtype_options`, `set_estimate_subtype`, `set_estimate_rate`, `apply_estimate_rate_to_all_matching`, `re_capture_estimate`. Use these when the user wants to amend subtypes or negotiate rates ("the TMCs are $400 each, not standard rate"; "change line 2 to volume+class"). Workflow:
 1. Always call `get_estimate_lines` first to see current state (it re-reads the modal, not the stale initial capture).
-2. For subtype edits: `list_estimate_subtype_options(line_index)` on one matching row first to read the exact option text, then `set_estimate_subtype` on each matching row.
+2. For subtype edits: `list_estimate_subtype_options(line_number=N)` on one matching row first to read the exact option text, then `set_estimate_subtype` on each matching row.
 3. Make the edits (`set_estimate_subtype` / `set_estimate_rate` / `apply_estimate_rate_to_all_matching`).
 4. When the user is satisfied, call `re_capture_estimate` to save and download a fresh PDF (`_v2`, `_v3`, … in Downloads).
 The user can also click PREVIEW manually in the qchub browser at any time — your tools and their clicks don't interfere.
 
-**LINE NUMBERING IS 1-BASED at the user boundary.** qchub's UI shows estimate lines starting at **Line 1** (not Line 0). When the user says "line 1", "line 7", "the first three lines" — they mean qchub's 1-based count. When you report lines back to the user, use 1-based too: "Line 1 is Lorraine Rd…", not "Line 0 is…". INTERNALLY, the tools take 0-based `line_index` (matches array indexing) — so subtract 1 when calling a tool from a user-given line number, and add 1 when quoting a line number back to the user. Get this wrong silently and the user edits the wrong row.
+**LINE NUMBERING IS 1-BASED EVERYWHERE.** qchub's UI shows estimate lines starting at **Line 1** (not Line 0). Tools take `line_number` (1-based) directly — no subtraction needed. When the user says "line 1" / "lines 2-5" / "the first three lines", pass those numbers verbatim to `set_estimate_subtype(line_number=...)`, `set_estimate_rate(line_number=...)`, `list_estimate_subtype_options(line_number=...)`. When reporting back, use the same 1-based numbers ("Line 1 is Lorraine Rd…", not "Line 0 is…"). The `get_estimate_lines` response includes both `index` (internal, 0-based, ignore) and `line_number` (1-based, this is what tools want and what the user means). Prior failure mode (run-20260525-212237): user said "change sites 1-4", Ellen passed `line_index=1,2,3,4`, qchub UI rows 2-5 changed. With `line_number` as the parameter name, that mistake is no longer possible.
 
 **NEVER ASK THE USER FOR LINE INDICES.** Users think in terms of "the roundabout", "the TMCs", "line 2 with the 250 E address" — not line numbers. When the user describes a row, call `get_estimate_lines`, match their description against the `description` field of each line (case-insensitive substring match against site name, time window, or subtype), and pick the index yourself. If the user's description matches MULTIPLE lines (e.g., "the roundabout" matches both AM and PM peak rows for that site), apply the edit to ALL matching lines (call set_estimate_subtype / set_estimate_rate once per matching index). If the description matches zero lines, surface the available descriptions and ask for clarification — never ask for an index number.
 
@@ -1143,12 +1143,19 @@ def _summarize_kmz_attachment(att) -> str:
     return "\n".join(lines)
 
 
+_RECAP_COALESCE_SEC = 4.0
+_recap_state_lock = threading.Lock()
+# Per-session coalesce state. Keyed by `id(qchub_edit_session)` so each
+# distinct order's recaps coalesce independently (multi-order future-proof).
+# Each entry: {"latest_serial": int, "last_real_result": dict | None,
+#              "counter": int, "in_flight_lock": threading.Lock}.
+_recap_state: dict[int, dict] = {}
+
+
 def _auto_recapture(qchub_edit_session) -> dict:
     """Chain a re_capture after an estimate edit so the saved PDF is
-    always in sync with the latest edit. Returns the re_capture result
-    (version + pdf_path + ...) or an error dict if the recapture
-    failed — the EDIT itself already succeeded by the time this runs,
-    so we never raise.
+    always in sync with the latest edit, BUT coalesce bursts of recap
+    requests so a batch of parallel edits produces ONE PDF, not N.
 
     Why this exists (user direction 2026-05-25): after Ellen made an
     edit she'd often stop and let the user open Estimate_NNNNN.pdf —
@@ -1156,24 +1163,92 @@ def _auto_recapture(qchub_edit_session) -> dict:
     separate tool call she didn't always make. Auto-chaining here
     means every edit call atomically refreshes the PDF.
 
-    Slow-path: each re_capture adds ~10-15s (PDF download + write).
-    For bulk edits via apply_rate_to_all_matching that's still ONE
-    re-capture (one tool call from Ellen). For sequences of
-    per-row edits the user incurs N re-captures, which is suboptimal
-    but always-correct. Optimize later if it becomes a UX problem.
+    Why coalesce (user direction 2026-05-25 night): per-edit recap was
+    producing v2/v3/v4/v5 PDFs for a 4-row batch in run-20260525-212237
+    (~80s wasted on N redundant 17s recaps + Downloads clutter). The
+    coalesce strategy: each call gets a serial number; sleeps for
+    `_RECAP_COALESCE_SEC`; after the sleep, if a NEWER call superseded
+    it, return the most recent cached result without recapturing. Only
+    the latest serial in a burst window does the actual recap.
+
+    Net effect:
+      - Single edit:        sleep 4s, then recap (one PDF). Cost: ~+4s.
+      - 4 parallel edits:   all sleep 4s; one recaps (one PDF), three
+                            return the same cached result. Cost: ~+4s
+                            total instead of 4 × 17s.
+      - 4 sequential edits (Ellen still doing the wrong pattern): each
+                            edit still triggers its own recap, but the
+                            4s coalesce gives the model time to fire a
+                            second edit; if it doesn't (truly sequential
+                            with model waiting on result), we degrade to
+                            the pre-coalesce per-edit cadence + 4s
+                            overhead each. Worst case ≈ status quo.
+
+    Returns the re_capture result (version + pdf_path + ...) or an error
+    dict if the recapture failed — the EDIT itself already succeeded by
+    the time this runs, so we never raise.
     """
-    try:
-        return qchub_edit_session.re_capture()
-    except Exception as exc:
-        return {
-            "error": (
-                f"Edit applied but auto-recapture failed: "
-                f"{type(exc).__name__}: {exc}. "
-                f"The edit IS live in the qchub modal; the saved PDF "
-                f"is the pre-edit version. User can call "
-                f"re_capture_estimate explicitly to refresh."
-            ),
-        }
+    import time as _time
+
+    session_key = id(qchub_edit_session)
+    with _recap_state_lock:
+        st = _recap_state.setdefault(session_key, {
+            "request_counter": 0,
+            "last_recap_at_request": 0,
+            "last_real_result": None,
+            "in_flight_lock": threading.Lock(),
+        })
+        st["request_counter"] += 1
+        my_request = st["request_counter"]
+        in_flight_lock = st["in_flight_lock"]
+
+    # Wait for any further recap requests to arrive in this burst. The
+    # edit that triggered THIS call has already been applied to qchub
+    # (the dispatcher runs the edit synchronously before calling us),
+    # so any recap that runs after this sleep window will pick up the
+    # edit regardless of which serial drives it.
+    _time.sleep(_RECAP_COALESCE_SEC)
+
+    # Coalesce check #1: did a recap already happen AFTER my request was
+    # registered? If so, my edit is included in that recap's result and
+    # mine would be redundant. Compare last_recap_at_request to my_request.
+    with _recap_state_lock:
+        if (
+            st["last_recap_at_request"] >= my_request
+            and st["last_real_result"] is not None
+        ):
+            return {**st["last_real_result"], "coalesced": True, "serial": my_request}
+
+    # Acquire the in-flight lock so only ONE actual recap runs at a time
+    # per session. Other coalesced callers may already be waiting here.
+    with in_flight_lock:
+        # Coalesce check #2: re-check after grabbing the lock. The recap
+        # we were waiting on (if any) may have finished while we blocked.
+        with _recap_state_lock:
+            if (
+                st["last_recap_at_request"] >= my_request
+                and st["last_real_result"] is not None
+            ):
+                return {**st["last_real_result"], "coalesced": True, "serial": my_request}
+        try:
+            result = qchub_edit_session.re_capture()
+            # Record the CURRENT request_counter (which may be higher than
+            # my_request if other threads queued during our work) so any
+            # peer waiting in the burst window sees their edit covered.
+            with _recap_state_lock:
+                st["last_real_result"] = result
+                st["last_recap_at_request"] = st["request_counter"]
+            return result
+        except Exception as exc:
+            return {
+                "error": (
+                    f"Edit applied but auto-recapture failed: "
+                    f"{type(exc).__name__}: {exc}. "
+                    f"The edit IS live in the qchub modal; the saved PDF "
+                    f"is the pre-edit version. User can call "
+                    f"re_capture_estimate explicitly to refresh."
+                ),
+            }
 
 
 def _scrub_dollars_from_estimate_result(result):
@@ -1190,8 +1265,10 @@ def _scrub_dollars_from_estimate_result(result):
     number; she has to point the user at the PDF.
 
     Preserves fields Ellen NEEDS for orchestration: description,
-    raw_text, line_index, pdf_path, version — everything useful for
-    matching rows + reporting which version of the PDF is current.
+    raw_text, line_number, index, pdf_path, version — everything useful
+    for matching rows + reporting which version of the PDF is current.
+    `line_number` is the 1-based row number Ellen uses to address tools;
+    `index` is the legacy 0-based internal counter (kept for back-compat).
 
     Works on dicts, lists of dicts, and nested structures. No-op on
     primitives + on dicts that don't contain any of the scrubbed keys.
@@ -1293,7 +1370,8 @@ def execute_tool(
                     payload = {"order_id": qchub_edit_session.order_id, "lines": lines}
                     return json.dumps(_scrub_dollars_from_estimate_result(payload), indent=2)
                 if name == "list_estimate_subtype_options":
-                    result = qchub_edit_session.list_subtype_options(int(args["line_index"]))
+                    # line_number is 1-based (qchub UI); internal API is 0-based.
+                    result = qchub_edit_session.list_subtype_options(int(args["line_number"]) - 1)
                     return json.dumps(_scrub_dollars_from_estimate_result(result), indent=2)
                 # The three edit tools (set_estimate_subtype,
                 # set_estimate_rate, apply_estimate_rate_to_all_matching)
@@ -1302,16 +1380,23 @@ def execute_tool(
                 # Without this, Ellen routinely "applies $400 to all
                 # rows" and then stops — leaving a stale PDF the user
                 # opens expecting updated numbers (observed
-                # run-20260524-232317).
+                # run-20260524-232317). The auto-recap is coalesced via
+                # `_auto_recapture` so a burst of parallel edits collapses
+                # to ONE PDF write (run-20260525-212237: 4 edits ->
+                # v2/v3/v4/v5 PDFs in ~80s; with coalesce: 1 PDF, ~20s).
                 if name == "set_estimate_subtype":
-                    edit = qchub_edit_session.set_subtype(int(args["line_index"]), str(args["subtype"]))
+                    # line_number is 1-based (qchub UI); internal API is 0-based.
+                    edit = qchub_edit_session.set_subtype(
+                        int(args["line_number"]) - 1, str(args["subtype"]),
+                    )
                     recap = _auto_recapture(qchub_edit_session)
                     return json.dumps(_scrub_dollars_from_estimate_result(
                         {"edit": edit, "recapture": recap}
                     ), indent=2)
                 if name == "set_estimate_rate":
+                    # line_number is 1-based (qchub UI); internal API is 0-based.
                     edit = qchub_edit_session.set_rate(
-                        int(args["line_index"]),
+                        int(args["line_number"]) - 1,
                         float(args["unit_price"]),
                         extra_rate=float(args.get("extra_rate", 0.0)),
                     )
