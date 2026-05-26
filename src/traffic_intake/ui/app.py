@@ -145,13 +145,28 @@ class MainWindow(QMainWindow):
         *,
         urgent: bool = False,
         timeout_ms: int = 5000,
+        always: bool = False,
     ) -> None:
         """Surface a Windows toast via the system tray icon. No-op if
         the tray isn't available. Always updates the status bar too so
         the info is visible without the toast.
+
+        Toast gating: by default the toast only fires when the main
+        window is UNFOCUSED. If the user is already looking at the
+        window they don't need an OS-level interruption; the chat
+        panel + status bar carry the same info. Set `always=True` to
+        force the toast (rare — used for genuinely-urgent failures
+        where we want attention even on the active window).
+        Established 2026-05-26 user direction: "toast on every
+        artifact-landed moment WHEN WINDOW UNFOCUSED."
         """
         self.status(message)
         if getattr(self, "_tray", None) is None:
+            return
+        # Urgent failures always toast — even if the window is active —
+        # so the user notices red-flag conditions. Non-urgent toasts
+        # only fire when the user isn't already watching the window.
+        if not always and not urgent and self.isActiveWindow():
             return
         icon_kind = (
             QSystemTrayIcon.MessageIcon.Critical
@@ -566,6 +581,21 @@ class MainWindow(QMainWindow):
         current = self.extraction_panel.request()
         if current is not None:
             self.extraction_panel.setRequest(current)
+        # Notify when Ellen's turn produced a new estimate PDF version.
+        # Track the last-notified PDF path on self; when artifacts
+        # show a different one, the user has a fresh PDF in Downloads
+        # worth flagging. Established 2026-05-26: post-edit recap PDFs
+        # were silent, the user had to hunt for the new file in
+        # Downloads rather than getting a toast.
+        current_pdf = self._artifacts.get("estimate_pdf_path")
+        last_pdf = getattr(self, "_last_notified_pdf", None)
+        if current_pdf and current_pdf != last_pdf:
+            from pathlib import Path as _P
+            self.notify(
+                "Estimate PDF updated",
+                f"New version saved: {_P(current_pdf).name}. Open it in Downloads.",
+            )
+            self._last_notified_pdf = current_pdf
         # If Ellen ended the session this turn (end_session tool fired),
         # drop our reference to the now-dead qchub edit session so the
         # NEXT chat turn doesn't pass it back to the worker.
@@ -1124,7 +1154,10 @@ class MainWindow(QMainWindow):
 
     def _on_email_draft_finished(self, result) -> None:
         self.btn_email.setEnabled(True)
-        self.status(f"Outlook draft opened: To {result.to}.")
+        self.notify(
+            "Email draft ready",
+            f"Outlook draft opened — to {result.to}. Review and click Send when ready.",
+        )
         body = (
             f"Outlook draft opened — review and click <b>Send</b> when ready.<br/>"
             f"&nbsp;&nbsp;<b>To:</b> {result.to}<br/>"
@@ -1262,7 +1295,11 @@ class MainWindow(QMainWindow):
         # enables its buttons below.
         self.extraction_panel.setRequest(request)
         n = request.total_locations
-        self.status(f"Extracted {n} location{'s' if n != 1 else ''} from {request.email_subject!r}.")
+        subj_short = _shorten(request.email_subject or "(no subject)", 60)
+        self.notify(
+            "Email extracted",
+            f"{n} location{'s' if n != 1 else ''} parsed from {subj_short!r}. Ellen's about to summarize.",
+        )
         for b in (self.btn_map, self.btn_qchub, self.btn_email):
             b.setEnabled(True)
         self.act_export_kmz.setEnabled(True)
