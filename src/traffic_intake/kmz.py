@@ -19,6 +19,11 @@ class Placemark:
     description: Optional[str]
     latitude: float
     longitude: float
+    # Set when the placemark's <ExtendedData> contains an `ellen_loc_id`
+    # entry — written by kml_export when building a KMZ from a StudyRequest,
+    # read back here on a user-edited re-drop to match the placemark to its
+    # original StudyLocation. None on third-party / new KMZs.
+    ellen_loc_id: Optional[int] = None
 
 
 _NS = {"kml": "http://www.opengis.net/kml/2.2"}
@@ -68,6 +73,27 @@ def parse_kml_bytes(data: bytes) -> list[Placemark]:
                 description=(desc_el.text.strip() if desc_el is not None and desc_el.text else None),
                 latitude=lat,
                 longitude=lon,
+                ellen_loc_id=_extract_ellen_loc_id(pm),
             )
         )
     return out
+
+
+def _extract_ellen_loc_id(pm: ET.Element) -> Optional[int]:
+    """Read the round-trip <ExtendedData><Data name='ellen_loc_id'><value>N</value>...
+    out of a placemark, if present. None for third-party KMZs.
+    """
+    ed = pm.find("ExtendedData")
+    if ed is None:
+        return None
+    for data_el in ed.findall("Data"):
+        if data_el.get("name") != "ellen_loc_id":
+            continue
+        value_el = data_el.find("value")
+        if value_el is None or not value_el.text:
+            return None
+        try:
+            return int(value_el.text.strip())
+        except ValueError:
+            return None
+    return None

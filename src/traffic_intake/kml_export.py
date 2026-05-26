@@ -81,6 +81,7 @@ def build_kml_for_locations(
     *,
     layer_name: str,
     description: Optional[str] = None,
+    request: Optional[StudyRequest] = None,
 ) -> KmlBuildResult:
     """Generate raw KML for a SUBSET of locations — one study group's worth.
 
@@ -92,8 +93,16 @@ def build_kml_for_locations(
     `layer_name` becomes the <Document><name>, which MyMaps surfaces as
     the layer label when this KML is imported as its own layer. qchub
     ignores the document name but still accepts the file fine.
+
+    `request` (optional): when provided, each emitted placemark also
+    carries an `ellen_loc_id` ExtendedData field with the location's
+    index in `request.locations`. This lets a user-edited KMZ re-drop
+    match its placemarks back to the active StudyRequest (see kmz.py
+    parser + kmz_rediff). Omit for non-MyMaps consumers (e.g. tests)
+    that don't need the round-trip ID.
     """
-    kml_text = _build_kml_from_locations(layer_name, description, locations)
+    loc_ids = _build_loc_ids(locations, request)
+    kml_text = _build_kml_from_locations(layer_name, description, locations, loc_ids=loc_ids)
     skipped = sum(1 for loc in locations if loc.estimate is None)
     placemark_count = len(locations) - skipped
     return KmlBuildResult(
@@ -102,6 +111,22 @@ def build_kml_for_locations(
         skipped_unplaced=skipped,
         map_title=layer_name,
     )
+
+
+def _build_loc_ids(
+    locations: list[StudyLocation], request: Optional[StudyRequest],
+) -> Optional[list[Optional[int]]]:
+    """Map each location to its StudyRequest.locations index, or None.
+
+    Returns None if no request was provided (no IDs to emit). Otherwise
+    returns a parallel list with `request.locations` indices — using
+    `is` identity, so renaming or coord-patching the same object still
+    keeps the same ID across multiple KML builds in one session.
+    """
+    if request is None:
+        return None
+    id_for: dict[int, int] = {id(loc): idx for idx, loc in enumerate(request.locations)}
+    return [id_for.get(id(loc)) for loc in locations]
 
 
 def build_map_title(request: StudyRequest) -> str:
@@ -124,15 +149,25 @@ _default_title = build_map_title
 
 
 def _build_kml(request: StudyRequest, title: str) -> str:
-    return _build_kml_from_locations(title, request.notes, request.locations)
+    # Full-request build: location index IS the ellen_loc_id.
+    loc_ids: list[Optional[int]] = list(range(len(request.locations)))
+    return _build_kml_from_locations(title, request.notes, request.locations, loc_ids=loc_ids)
 
 
 def _build_kml_from_locations(
     title: str,
     description: Optional[str],
     locations: list[StudyLocation],
+    *,
+    loc_ids: Optional[list[Optional[int]]] = None,
 ) -> str:
-    """Shared KML emission used by both full-request and per-group builders."""
+    """Shared KML emission used by both full-request and per-group builders.
+
+    `loc_ids` (optional): parallel list to `locations`; when provided,
+    each placemark gets an `ellen_loc_id` ExtendedData field carrying
+    its index in the StudyRequest. Missing IDs (None entries) emit no
+    ExtendedData for that placemark.
+    """
     out: list[str] = []
     out.append('<?xml version="1.0" encoding="UTF-8"?>')
     out.append('<kml xmlns="http://www.opengis.net/kml/2.2">')
@@ -147,10 +182,11 @@ def _build_kml_from_locations(
     # User refines pins manually in MyMaps post-import as part of back-office.
     out.append(_PIN_STYLES.strip())
 
-    for loc in locations:
+    for i, loc in enumerate(locations):
         if loc.estimate is None:
             continue
-        out.append(_placemark_xml(loc))
+        loc_id = loc_ids[i] if loc_ids is not None else None
+        out.append(_placemark_xml(loc, loc_id=loc_id))
 
     out.append("</Document>")
     out.append("</kml>")
@@ -184,18 +220,30 @@ def _style_id_for_location(loc: StudyLocation) -> str:
     return "icon-1899-0F9D58"              # 1-3 Tube (green teardrop)
 
 
-def _placemark_xml(loc: StudyLocation) -> str:
+def _placemark_xml(loc: StudyLocation, *, loc_id: Optional[int] = None) -> str:
     style_id = _style_id_for_location(loc)
     name = loc.site_name or "(unnamed)"
     desc = _location_description(loc)
     assert loc.estimate is not None
     lat = loc.estimate.latitude
     lon = loc.estimate.longitude
+    # ExtendedData is preserved by MyMaps round-trip — user edits a pin,
+    # exports as KMZ, our parser reads the same ellen_loc_id back and matches
+    # the placemark to the original StudyLocation. Only emitted when loc_id
+    # is set (caller passes via _build_kml_from_locations).
+    extended = ""
+    if loc_id is not None:
+        extended = (
+            "<ExtendedData>"
+            f'<Data name="ellen_loc_id"><value>{loc_id}</value></Data>'
+            "</ExtendedData>"
+        )
     return (
         "<Placemark>"
         f"<name>{xml_escape(name)}</name>"
         f"<description><![CDATA[{desc}]]></description>"
         f"<styleUrl>#{style_id}</styleUrl>"
+        f"{extended}"
         f"<Point><coordinates>{lon:.6f},{lat:.6f},0</coordinates></Point>"
         "</Placemark>"
     )
