@@ -76,7 +76,10 @@ class DropZone(QWidget):
         self.title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.title)
 
-        self.subtitle = QLabel("Drag from Outlook, or drop a .eml / .msg file from File Explorer.")
+        self.subtitle = QLabel(
+            "Drag from Outlook, or drop a .eml / .msg file from File Explorer. "
+            "After a map is built, also accepts an edited .kmz to apply pin corrections."
+        )
         self.subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.subtitle)
 
@@ -195,7 +198,10 @@ class DropZone(QWidget):
                 if not url.isLocalFile():
                     continue
                 p = Path(url.toLocalFile())
-                if p.suffix.lower() in (".eml", ".msg"):
+                # .eml/.msg = new-job email drop (existing path).
+                # .kmz/.kml = re-drop of Ellen's exported map (rediff path,
+                # gated on an active StudyRequest by the on_file_dropped handler).
+                if p.suffix.lower() in (".eml", ".msg", ".kmz", ".kml"):
                     return p
 
         fc_format = next((f for f in FC_MIME_CANDIDATES if mime.hasFormat(f)), None)
