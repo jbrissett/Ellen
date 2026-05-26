@@ -769,6 +769,79 @@ class MainWindow(QMainWindow):
             parts.append(f"<i>{result.note}</i>")
         self.chat_panel.appendSystemNote("<br/>".join(parts))
 
+        # Fire a synthetic post-qchub turn so Ellen actually acts on any
+        # pending pre-submit pricing/subtype instructions instead of just
+        # idling until the user reminds her. Same pattern as
+        # `_fire_warmup_turn` after extraction. Established 2026-05-26
+        # run-20260526-120226: Ellen acknowledged "both are Large"
+        # pre-submit, qchub submitted, the system note explicitly told
+        # her the modal was open and to apply pending instructions —
+        # she still wrote "I'll apply when the modal confirms open" and
+        # sat there until the user re-asked. The synthetic turn forces
+        # her to respond now, with the modal genuinely open, while her
+        # acknowledgment of the user's instruction is still fresh in
+        # her conversation history.
+        if (
+            self._has_api_key()
+            and getattr(self, "_qchub_edit_session", None) is not None
+            and result.estimate is not None
+            and result.estimate.lines
+        ):
+            self._fire_post_qchub_turn(result)
+
+    def _fire_post_qchub_turn(self, result: "CreateOrderResult") -> None:
+        """Synthetic chat turn fired right after the qchub completion
+        system-note posts. Tells Ellen the modal is open, asks her to
+        scan her own conversation history for pending instructions, and
+        apply them now via the batched edit pattern.
+        """
+        order_id = result.order_id or "(no ID captured)"
+        line_count = len(result.estimate.lines) if result.estimate else 0
+        message = (
+            f"[SYSTEM] qchub order {order_id} just submitted successfully. "
+            f"The estimate modal is OPEN with {line_count} parsed line(s). "
+            "ALL edit tools (set_estimate_subtype, set_estimate_rate, "
+            "apply_rate_to_location, apply_rate_to_all_locations, "
+            "apply_rate_to_rest_of_group, re_capture_estimate) are LIVE "
+            "RIGHT NOW. The qchub_edit_session is wired — do not hedge "
+            "with 'when the modal is up' / 'as soon as it confirms open' / "
+            "etc. IT IS UP.\n\n"
+            "Scan THIS conversation's prior turns for any pricing or "
+            "subtype instructions the user has stated (e.g., 'all are "
+            "Large', '$320 per TMC', 'the roundabout is Complex'). For "
+            "EACH such instruction:\n"
+            "  1. Fire the relevant edit tool calls in THIS response "
+            "(parallel — batch them; per the BATCH MULTI-ROW rule).\n"
+            "  2. Then in your NEXT response, call re_capture_estimate "
+            "exactly ONCE.\n"
+            "  3. Then post the close: '[concise summary of what landed]. "
+            "Anything else?'\n\n"
+            "If there are NO pending instructions, just post the close "
+            "with the v1 PDF: 'Order N submitted, estimate PDF in "
+            "Downloads. Anything else?' — do not invent edits.\n\n"
+            "Important qchub quirk: the estimate modal renders TMC rows "
+            "at 'Standard' by default REGARDLESS of what subtype was "
+            "set at the group level pre-submit. If the user has "
+            "indicated a non-Standard subtype (Large / Complex) and "
+            "you can see TMC rows that need updating, that's a pending "
+            "instruction — apply it now even though you 'already set' "
+            "the subtype on the StudyLocation pre-submit. Those are "
+            "two different state surfaces."
+        )
+        self.chat_panel.setBusy(True)
+        run_chat(
+            message,
+            self._chat_history,
+            self.extraction_panel.request(),
+            self._artifacts,
+            on_text_delta=self.chat_panel.appendAssistantDelta,
+            on_tool_result=self.chat_panel.appendToolResult,
+            on_action_request=self._on_chat_action_request,
+            on_finished=self._on_chat_finished,
+            on_failed=self._on_chat_failed,
+            qchub_edit_session=getattr(self, "_qchub_edit_session", None),
+        )
+
     def _on_qchub_failed(self, message: str) -> None:
         self.btn_qchub.setEnabled(True)
         self.drop_zone.setBusy(False)
