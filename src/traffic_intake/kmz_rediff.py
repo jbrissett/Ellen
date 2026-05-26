@@ -202,6 +202,52 @@ def _haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     return 2 * R * math.asin(min(1.0, math.sqrt(a)))
 
 
+def apply_unambiguous(request: StudyRequest, rediff: Rediff) -> tuple[int, int]:
+    """Apply the changes that don't need user input: moves and renames.
+
+    Returns (moves_applied, renames_applied) for reporting.
+
+    Moves update `location.estimate.latitude/longitude` and mark the
+    estimate's source as "manual" with confidence "high" — the user
+    physically dragged the pin to where they want it, that's as
+    authoritative as it gets.
+
+    Renames update both `site_name` (the friendly map label) AND
+    `address_or_intersection` (the value qchub will use as the site
+    name). User asked 2026-05-25 for renames to flow all the way to
+    qchub, not just be display labels.
+
+    New and missing pins are NOT touched here — those require a chat
+    exchange to resolve (study type for new, confirm-drop for missing).
+    """
+    from .models import LocationEstimate
+
+    moves = 0
+    for m in rediff.moved:
+        loc = request.locations[m.loc_id]
+        existing_notes = loc.estimate.notes if loc.estimate else None
+        loc.estimate = LocationEstimate(
+            latitude=m.new_lat,
+            longitude=m.new_lng,
+            confidence="high",
+            source="manual",
+            notes=(
+                f"User repositioned pin from {m.old_lat:.6f},{m.old_lng:.6f} "
+                f"({m.distance_m:.0f}m). Prior: {existing_notes or 'none'}"
+            ),
+        )
+        moves += 1
+
+    renames = 0
+    for r in rediff.renamed:
+        loc = request.locations[r.loc_id]
+        loc.site_name = r.new_name
+        loc.address_or_intersection = r.new_name
+        renames += 1
+
+    return moves, renames
+
+
 def summarize(rediff: Rediff) -> str:
     """One-paragraph summary of the diff suitable for posting in chat.
 
