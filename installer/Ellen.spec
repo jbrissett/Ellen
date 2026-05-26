@@ -61,7 +61,13 @@ if _BAKED.exists():
 
 
 a = Analysis(
-    [str(SRC / "traffic_intake" / "ui" / "__main__.py")],
+    # Top-level launcher, NOT the package's __main__.py. PyInstaller's
+    # bootloader runs the entry as bare `__main__` (no parent package),
+    # which breaks relative imports inside traffic_intake/ui/__main__.py.
+    # The launcher imports `main()` as a fully-qualified module call, so
+    # every `from ..first_launch import ...` resolves correctly. Don't
+    # collapse this back to the package __main__.
+    [str(REPO / "installer" / "ellen_launch.py")],
     pathex=[str(SRC)],
     binaries=[],
     datas=DATAS,
