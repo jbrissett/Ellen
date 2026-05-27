@@ -23,12 +23,25 @@ setlocal ENABLEDELAYEDEXPANSION
 set "REPO=%~dp0.."
 pushd "%REPO%"
 
-if not exist .venv\Scripts\python.exe (
-    echo ERROR: .venv not found. Set up the dev venv first.
+REM Pick the venv to build with. Default is `.venv` (the dev venv on
+REM whatever architecture the developer's machine is). Override via
+REM `set VENV=.venv-x64` (or any folder name) before invoking — needed
+REM when the dev machine is ARM64 but we want to ship an x64 .exe.
+REM Established 2026-05-27 after a colleague hit "code 216 — not
+REM compatible with the version of Windows" on the ARM64-built v1.0.0.
+if "%VENV%"=="" set "VENV=.venv"
+if not exist %VENV%\Scripts\python.exe (
+    echo ERROR: %VENV% not found. Set up the venv first.
+    echo   To build for the colleague's x64 machines from this ARM64 host:
+    echo     1. Install Python 3.12 x64 from python.org
+    echo     2. ^<x64 python^> -m venv .venv-x64
+    echo     3. .venv-x64\Scripts\pip install -r requirements.txt -r requirements-dev.txt
+    echo     4. set VENV=.venv-x64 ^&^& tools\build_installer.bat
     popd
     exit /b 1
 )
-set "VENV_PY=%REPO%\.venv\Scripts\python.exe"
+set "VENV_PY=%REPO%\%VENV%\Scripts\python.exe"
+echo (Using venv: %VENV%)
 
 REM 1. Read the baked keys from keyring + generate _baked_keys.py.
 REM    Module is gitignored; lives only for this build's lifetime.
