@@ -1,26 +1,36 @@
-"""First-launch setup — verify Playwright's msedge channel is ready.
+"""First-launch setup — `playwright install msedge` on the first run.
 
 When Ellen ships via the installer, the .exe doesn't bundle the
-Playwright browser binaries (saves ~150MB on the installer). Instead,
-on first launch we ensure `playwright install msedge` has run at
-least once. Marker file at `%LOCALAPPDATA%/TrafficIntake/.playwright_setup`
-records that it's done; subsequent launches skip the check entirely.
+Playwright browser binaries. Instead, on first launch we run
+`playwright install msedge` once — downloads ~150MB to a per-user
+writable directory, then a marker file at
+`%LOCALAPPDATA%/TrafficIntake/.playwright_setup` records it's done
+so subsequent launches skip the check entirely.
 
-For the msedge channel specifically, "install" is fast — Edge ships
-with Windows 11, so Playwright only needs to register it + download
-its driver. Typical first-launch time is 5-30s, not the multi-minute
-download some channels need.
-
-If the user's machine doesn't have Edge at all (rare on Win 11), the
-install will fail. We surface a clean error in that case.
-
-This module is import-light so it can run inside the splash before
-the heavy MainWindow construction. The actual install runs in a Qt
-worker thread; this module exposes the worker class.
+History (2026-05-26 → 2026-05-27):
+  - v1 attempt 1: shell out to `sys.executable -m playwright install
+    msedge`. Backfired because sys.executable in a PyInstaller bundle
+    is Ellen.exe (not a Python interpreter), so the subprocess just
+    re-launched Ellen, hit single-instance lock, handed off args, and
+    exited — looping orphan instances forever.
+  - v1 attempt 2 (the BAD assumption): bypass install entirely on
+    the theory that the bundled `_internal/playwright/driver` was
+    sufficient. Colleague hit the real error on his x64 machine:
+    Playwright tried to launch chromium at
+    `_internal/playwright/driver/package/.local-browsers/chromium-1223/
+    chrome-win64/chrome.exe` which doesn't exist (.local-browsers is
+    populated by `playwright install`, not by PyInstaller's hooks).
+    msedge channel also failed without the install — its channel
+    registration data lives in the same .local-browsers tree.
+  - v1.0.1 (this): in-process call to `playwright.__main__.main()`
+    avoids the sys.executable trap. Combined with
+    PLAYWRIGHT_BROWSERS_PATH pointing at a writable per-user dir, the
+    install lands in `%LOCALAPPDATA%/TrafficIntake/playwright-browsers/`
+    and Playwright's runtime browser discovery finds them there.
 """
 from __future__ import annotations
 
-import subprocess
+import os
 import sys
 from pathlib import Path
 from typing import Callable
@@ -30,36 +40,56 @@ from PySide6.QtCore import QObject, QRunnable, Signal
 from . import config
 
 
+def playwright_browsers_dir() -> Path:
+    """Per-user, writable directory where Playwright stores its
+    downloaded browser binaries. We control the path via the
+    PLAYWRIGHT_BROWSERS_PATH env var (see configure_playwright_env).
+    """
+    return config.app_data_dir() / "playwright-browsers"
+
+
+def configure_playwright_env() -> None:
+    """Point Playwright at a writable per-user browser directory.
+
+    Without this, Playwright defaults to
+    `<playwright_install_dir>/driver/package/.local-browsers/`, which
+    inside a PyInstaller bundle resolves to a read-only path under
+    `_internal/playwright/...`. Both `playwright install` and the
+    runtime browser-discovery walk would fail there.
+
+    MUST be called BEFORE any code path imports playwright — once
+    playwright's drivers module reads PLAYWRIGHT_BROWSERS_PATH on
+    import, it caches the value.
+
+    On a dev checkout (sys.frozen unset) we leave the env alone so
+    Playwright uses its default (~/AppData/Local/ms-playwright/),
+    where the developer has presumably already run `playwright install`.
+    """
+    if not getattr(sys, "frozen", False):
+        return
+    os.environ.setdefault(
+        "PLAYWRIGHT_BROWSERS_PATH",
+        str(playwright_browsers_dir()),
+    )
+
+
 def _marker_path() -> Path:
     return config.app_data_dir() / ".playwright_setup"
 
 
 def playwright_browser_ready() -> bool:
-    """First-launch install BYPASSED 2026-05-26.
-
-    Original design: shell out to `playwright install msedge` on first
-    launch + write a marker file once done. Backfired in the PyInstaller
-    build because sys.executable points to the bundled Ellen.exe (not
-    a Python interpreter), so `sys.executable -m playwright install ...`
-    just re-launched Ellen, which hit the single-instance lock + handed
-    off — spawning a loop of orphan Ellen instances and never actually
-    installing Playwright.
-
-    Reality check: the PyInstaller bundle ALREADY ships Playwright's
-    full driver (verified in the build log — `playwright/driver/
-    node.exe` etc are all in dist/Ellen/_internal/playwright/), and
-    msedge channel uses system-installed Edge which ships with Win 11.
-    So no install step is required on a properly bundled .exe — the
-    first launch can go straight to MainWindow.
-
-    Keeping the file + symbol so the import in ui/__main__.py still
-    resolves; the function just always returns True so the install
-    code path never fires. Re-enabling the proper install (via
-    `from playwright.__main__ import main` direct invocation, not
-    subprocess) is a future-improvement if a deployment surfaces a
-    machine without Edge or with a missing Playwright driver.
+    """True if the first-launch install has already completed.
+    Fast — just a file-existence check.
     """
-    return True
+    return _marker_path().exists()
+
+
+def mark_playwright_browser_ready() -> None:
+    """Write the marker file so future launches skip the install step."""
+    try:
+        _marker_path().write_text("ok\n", encoding="utf-8")
+    except Exception:
+        pass
 
 
 def mark_playwright_browser_ready() -> None:
@@ -83,10 +113,12 @@ class PlaywrightInstallWorker(QRunnable):
     splash stays responsive. Emits progress / finished / failed signals
     over `self.signals`.
 
-    The actual subprocess: `python -m playwright install msedge`. When
-    we're frozen by PyInstaller, `sys.executable` is the bundled .exe;
-    we still invoke playwright as a module of THIS interpreter, which
-    works because PyInstaller bundles playwright + its CLI entry point.
+    Implementation: in-process call to `playwright.__main__.main(['install',
+    'msedge'])`. Bypasses sys.executable (which in a PyInstaller bundle
+    is Ellen.exe, not a Python interpreter — see module-level history).
+    Playwright then writes the downloaded browsers under
+    PLAYWRIGHT_BROWSERS_PATH (set by configure_playwright_env() in
+    __main__.py).
     """
 
     def __init__(self) -> None:
@@ -96,47 +128,32 @@ class PlaywrightInstallWorker(QRunnable):
     def run(self) -> None:
         try:
             self.signals.progress.emit(
-                "Setting up browser support (one-time, usually ~10-30 seconds)…"
+                "Downloading browser support (one-time, ~150MB)…"
             )
-            # `-u` for unbuffered stdout so we can stream progress lines
-            # back to the splash if Playwright emits any.
-            cmd = [sys.executable, "-u", "-m", "playwright", "install", "msedge"]
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                creationflags=(
-                    0x08000000  # CREATE_NO_WINDOW — don't pop a console
-                    if sys.platform == "win32" else 0
-                ),
-            )
-            # Stream output so the splash can show something living
-            # rather than a static "setting up…" string.
-            if proc.stdout is not None:
-                for raw in proc.stdout:
-                    line = raw.strip()
-                    if line:
-                        # Trim to first ~80 chars so it fits the splash.
-                        self.signals.progress.emit(line[:80])
-            rc = proc.wait()
+            from playwright.__main__ import main as pw_main
+
+            # pw_main raises SystemExit on completion (mirrors a CLI
+            # invocation). Catch + inspect the exit code so we can
+            # distinguish success (0) from failure (nonzero) without
+            # tearing down the worker thread.
+            rc = 0
+            try:
+                pw_main(["install", "msedge"])
+            except SystemExit as se:
+                rc = int(se.code or 0)
+
             if rc != 0:
                 self.signals.failed.emit(
                     f"playwright install msedge exited with code {rc}. "
                     "If Microsoft Edge isn't installed on this machine, "
                     "install it from https://www.microsoft.com/edge and "
-                    "re-launch Ellen."
+                    "re-launch Ellen. If Edge IS installed, check your "
+                    "internet connection — Playwright downloads ~150MB "
+                    "of browser components from a Microsoft CDN."
                 )
                 return
             mark_playwright_browser_ready()
             self.signals.finished.emit()
-        except FileNotFoundError as exc:
-            # sys.executable missing — should be impossible from a
-            # PyInstaller bundle but handle it gracefully.
-            self.signals.failed.emit(
-                f"Couldn't run the installer subprocess: {exc}"
-            )
         except Exception as exc:
             self.signals.failed.emit(
                 f"Unexpected error during browser setup: "

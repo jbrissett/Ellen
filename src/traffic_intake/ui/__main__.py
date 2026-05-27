@@ -221,6 +221,21 @@ def _claim_distinct_taskbar_identity() -> None:
 
 
 def main() -> int:
+    # 0. Point Playwright at a per-user writable browser directory
+    # BEFORE any module touches playwright. In a PyInstaller bundle the
+    # default `_internal/playwright/driver/package/.local-browsers/`
+    # location is read-only, so both `playwright install` and runtime
+    # browser-discovery would fail there. Pointing at
+    # %LOCALAPPDATA%/TrafficIntake/playwright-browsers/ keeps writes +
+    # reads in a per-user space we control. No-op on dev checkouts
+    # (where the developer's default ms-playwright dir is already
+    # populated). Established 2026-05-27 after a colleague's x64 install
+    # failed on first MyMaps run because the bundled `.local-browsers`
+    # was missing the browser binaries (PyInstaller hooks don't include
+    # them; `playwright install` writes them, separately).
+    from ..first_launch import configure_playwright_env
+    configure_playwright_env()
+
     # 1. Claim a distinct Windows AppUserModelID BEFORE QApplication
     # constructs (and thus before any window appears) so the taskbar
     # uses our app icon instead of python.exe's.
